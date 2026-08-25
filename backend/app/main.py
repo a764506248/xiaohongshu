@@ -5,13 +5,16 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.ai.provider import get_llm_provider
 from app.api import router
+from app.operations_api import router as operations_router
 from app.core.config import get_settings
 from app.core.database import Base, SessionLocal, engine
 from app.workflows.content_creation.graph import ContentWorkflow
+from app.media import STORAGE_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +39,29 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+    app = FastAPI(
+        title=settings.app_name,
+        version="0.2.0",
+        description=(
+            "基于 FastAPI、LangGraph 和 PostgreSQL 的 AI 自媒体内容生产 API。\n\n"
+            "推荐调用顺序：创建任务 → 生成候选选题 → 选择选题 → 审核文章 → 生成小红书内容包。\n\n"
+            "当前为内部运营系统，尚未启用登录鉴权。耗时的模型接口可能需要等待数十秒。"
+        ),
+        openapi_tags=[
+            {"name": "系统", "description": "服务健康状态和基础信息。"},
+            {"name": "内容任务", "description": "内容生产流程的根对象；任务状态决定前端当前展示的操作。"},
+            {"name": "候选选题", "description": "调用 LLM 生成候选选题，并通过人工选择恢复 LangGraph。"},
+            {"name": "文章与版本", "description": "查询 AI 文案、历史版本以及保存人工编辑版本。历史版本不会被覆盖。"},
+            {"name": "人工审核", "description": "通过、退回、重新生成或人工修改后通过文章。request_id 用于幂等。"},
+            {"name": "小红书内容包", "description": "将审核完成的文章转换为发布文案、3～5 张图片和 ZIP。"},
+            {"name": "图片页面", "description": "编辑图片文字、切换模板、重新生成或上传人工替换图片。"},
+            {"name": "渠道账号", "description": "管理小红书和微信公众号账号；凭证只保存外部引用。"},
+            {"name": "多平台内容", "description": "把审核终稿转换为小红书和微信公众号独立版本。"},
+            {"name": "发布任务", "description": "发布审批、排期、幂等执行、人工确认和失败重试。"},
+            {"name": "运营数据", "description": "发布指标回流、偏好信号、标题查重和模型成本。"},
+        ],
+        lifespan=lifespan,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -57,13 +82,15 @@ def create_app() -> FastAPI:
         logger.exception("Unhandled error", exc_info=exc)
         return JSONResponse(status_code=500, content={"detail": "服务器内部错误"})
 
-    @app.get("/health")
+    @app.get("/health", tags=["系统"], summary="检查服务健康状态", description="用于本地启动检查、容器健康检查和部署探针。")
     def health():
         return {"status": "ok"}
 
     app.include_router(router)
+    app.include_router(operations_router)
+    STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+    app.mount("/media", StaticFiles(directory=STORAGE_ROOT), name="media")
     return app
 
 
 app = create_app()
-

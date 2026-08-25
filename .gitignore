@@ -7,6 +7,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 backend/.venv/
+backend/storage/images/
 frontend/node_modules/
 frontend/dist/
 *.tsbuildinfo

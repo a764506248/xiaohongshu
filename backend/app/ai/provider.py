@@ -1,4 +1,5 @@
 import json
+import re
 from dataclasses import asdict, dataclass
 
 import httpx
@@ -129,12 +130,98 @@ class OpenRouterLLMProvider(LLMProvider):
         return ArticleOutput(**data)
 
 
+class SenseNovaLLMProvider(LLMProvider):
+    """Anthropic Messages compatible adapter for token.sensenova.cn."""
+
+    def __init__(self, base_url: str, model: str, api_key: str, timeout: float = 120):
+        if not api_key:
+            raise RuntimeError("SenseNova LLM_API_KEY 未配置")
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def _message(self, system: str, user: str, max_tokens: int = 4096) -> str:
+        response = httpx.post(
+            f"{self.base_url}/messages",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01",
+            },
+            json={
+                "model": self.model,
+                "max_tokens": max_tokens,
+                "system": system,
+                "messages": [{"role": "user", "content": user}],
+            },
+            timeout=self.timeout,
+        )
+        if response.is_error:
+            detail = response.text[:500]
+            raise RuntimeError(f"SenseNova 请求失败（HTTP {response.status_code}）：{detail}")
+        blocks = response.json().get("content", [])
+        text = "".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+        if not text:
+            raise RuntimeError("SenseNova 响应中没有文本内容")
+        return text
+
+    @staticmethod
+    def _parse_json(text: str) -> dict:
+        cleaned = text.strip()
+        fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, re.DOTALL)
+        if fenced:
+            cleaned = fenced.group(1)
+        else:
+            start, end = cleaned.find("{"), cleaned.rfind("}")
+            if start >= 0 and end > start:
+                cleaned = cleaned[start:end + 1]
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("SenseNova 未返回有效 JSON") from exc
+
+    def generate_topics(self, title: str, requirement: str, audience: str, instruction: str = "") -> list[TopicOutput]:
+        text = self._message(
+            "你是教育培训公司的中文内容运营专家。只输出合法 JSON，不要 Markdown 代码块。",
+            "请生成4个有技术含量、避免夸张承诺的候选选题。JSON格式必须为："
+            '{"topics":[{"title":"", "summary":"", "target_reader":"", "reason":"", "score":90}]}。'
+            f"\n内容方向：{title}\n目标受众：{audience}\n基础要求：{requirement}\n补充要求：{instruction}",
+        )
+        data = self._parse_json(text)
+        topics = data.get("topics")
+        if not isinstance(topics, list) or not topics:
+            raise RuntimeError("SenseNova 返回的选题列表为空")
+        return [TopicOutput(**item) for item in topics]
+
+    def generate_article(self, topic: TopicOutput, instruction: str = "") -> ArticleOutput:
+        text = self._message(
+            "你是 AI 应用开发培训领域的中文技术作者。直接输出完整 Markdown 文章，不要输出 JSON，不要使用代码块包裹整篇文章。",
+            "请生成准确、实用、结构清晰且措辞克制的中文技术文章。"
+            "正文需要包含清晰的二级标题、实践步骤和常见误区，避免夸张承诺。"
+            f"\n选题信息：{json.dumps(asdict(topic), ensure_ascii=False)}\n修订要求：{instruction}",
+            max_tokens=8192,
+        )
+        content = text.strip()
+        headings = re.findall(r"^##\s+(.+)$", content, re.MULTILINE)
+        outline = "\n".join(f"{index + 1}. {heading.strip()}" for index, heading in enumerate(headings))
+        if not outline:
+            outline = "1. 背景与问题\n2. 核心方法\n3. 实践步骤\n4. 常见误区\n5. 行动建议"
+        title_match = re.search(r"^#\s+(.+)$", content, re.MULTILINE)
+        article_title = title_match.group(1).strip() if title_match else topic.title
+        return ArticleOutput(title=article_title, outline=outline, content=content)
+
+
 def get_llm_provider() -> LLMProvider:
     settings = get_settings()
     if settings.llm_provider == "mock":
         return MockLLMProvider()
     if settings.llm_provider == "openrouter":
         return OpenRouterLLMProvider(
+            settings.llm_base_url, settings.llm_model, settings.llm_api_key, settings.llm_timeout_seconds
+        )
+    if settings.llm_provider == "sensenova":
+        return SenseNovaLLMProvider(
             settings.llm_base_url, settings.llm_model, settings.llm_api_key, settings.llm_timeout_seconds
         )
     raise RuntimeError(f"不支持的 LLM_PROVIDER：{settings.llm_provider}")
