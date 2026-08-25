@@ -1,0 +1,27 @@
+[project]
+name = "xiaohongshu-operator-api"
+version = "0.1.0"
+description = "AI content operations backend"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.13",
+  "fastapi>=0.115",
+  "httpx>=0.28",
+  "langgraph>=1.0,<2",
+  "langgraph-checkpoint-postgres>=2.0",
+  "psycopg[binary,pool]>=3.2",
+  "pydantic-settings>=2.7",
+  "sqlalchemy>=2.0",
+  "uvicorn[standard]>=0.34",
+]
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28",
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
