@@ -1,5 +1,384 @@
-import { useEffect, useState } from 'react'
-import { contentApi } from '../api/content'
-import { Notice } from '../components/Notice'
-import type { PublishJob } from '../types'
-export function PublishingPage(){const [jobs,setJobs]=useState<PublishJob[]>([]);const [error,setError]=useState('');const load=()=>contentApi.listPublishJobs().then(setJobs).catch(e=>setError(e.message));useEffect(()=>{void load()},[]);async function act(fn:()=>Promise<unknown>){try{await fn();await load()}catch(e){setError((e as Error).message)}}return <main><div className="page-heading"><div><p className="eyebrow">PHASE 4</p><h1>发布审批与排期</h1><p>发布前统一审批；人工账号确认结果，模拟账号可以自动执行。</p></div></div>{error&&<Notice>{error}</Notice>}<section className="panel">{jobs.length===0&&<div className="empty">暂无发布任务，请先从多平台内容页创建。</div>}{jobs.map(j=><article className="publish-row" key={j.id}><div><strong>{j.status}</strong><p>{j.scheduled_at?new Date(j.scheduled_at).toLocaleString('zh-CN'):'审批后立即执行'} · 重试 {j.retry_count}/{j.max_retries}</p>{j.external_post_id&&<small>{j.external_post_id}</small>}</div><div className="row-actions">{j.approval_status==='pending'&&<><button className="button primary" onClick={()=>act(()=>contentApi.decidePublishJob(j.id,'approve'))}>批准</button><button className="button secondary" onClick={()=>act(()=>contentApi.decidePublishJob(j.id,'reject','运营拒绝'))}>拒绝</button></>}{j.status==='approved'&&<button className="button primary" onClick={()=>act(()=>contentApi.executePublishJob(j.id))}>立即执行</button>}{j.status==='awaiting_manual_publish'&&<button className="button primary" onClick={()=>{const value=prompt('填写平台内容 ID 或 URL');if(value)act(()=>contentApi.completeManual(j.id,value))}}>确认人工发布</button>}{j.status==='published'&&<button className="button secondary" onClick={()=>{const views=Number(prompt('阅读/曝光数','1000'));if(Number.isFinite(views))act(()=>contentApi.addMetric(j.id,{views,likes:50,favorites:20,comments:10,shares:5,follower_gain:2}))}}>录入效果数据</button>}</div></article>)}</section></main>}
+import {
+  CheckOutlined,
+  CloseOutlined,
+  CloudUploadOutlined,
+  ReloadOutlined,
+} from "@ant-design/icons";
+import {
+  Alert,
+  Button,
+  Card,
+  Form,
+  Input,
+  InputNumber,
+  Modal,
+  Segmented,
+  Space,
+  Statistic,
+  Table,
+  Tag,
+  Tooltip,
+} from "antd";
+import { useEffect, useMemo, useState } from "react";
+import { contentApi } from "../api/content";
+import { useAuth } from "../auth";
+import type { PublishJob } from "../types";
+
+const statusMap: Record<string, { text: string; color: string }> = {
+  pending_approval: { text: "待审批", color: "gold" },
+  approved: { text: "待执行", color: "blue" },
+  scheduled: { text: "已排期", color: "cyan" },
+  awaiting_manual_publish: { text: "等待人工发布", color: "purple" },
+  publishing: { text: "发布中", color: "processing" },
+  published: { text: "已发布", color: "success" },
+  failed: { text: "发布失败", color: "error" },
+  rejected: { text: "已拒绝", color: "default" },
+};
+const channelMap: Record<string, string> = {
+  xiaohongshu: "小红书",
+  wechat: "微信公众号",
+};
+
+export function PublishingPage() {
+  const { can } = useAuth();
+  const [jobs, setJobs] = useState<PublishJob[]>([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState("all");
+  const [manualJob, setManualJob] = useState<PublishJob | null>(null);
+  const [metricJob, setMetricJob] = useState<PublishJob | null>(null);
+  const [manualForm] = Form.useForm();
+  const [metricForm] = Form.useForm();
+  const load = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      setJobs(await contentApi.listPublishJobs());
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => {
+    void load();
+  }, []);
+  const filtered = useMemo(
+    () =>
+      filter === "all"
+        ? jobs
+        : jobs.filter((job) =>
+            filter === "pending"
+              ? job.approval_status === "pending"
+              : job.status === filter,
+          ),
+    [jobs, filter],
+  );
+  const counts = {
+    pending: jobs.filter((j) => j.approval_status === "pending").length,
+    manual: jobs.filter((j) => j.status === "awaiting_manual_publish").length,
+    published: jobs.filter((j) => j.status === "published").length,
+    failed: jobs.filter((j) => j.status === "failed").length,
+  };
+  async function act(fn: () => Promise<unknown>) {
+    setError("");
+    try {
+      await fn();
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+  async function completeManual() {
+    const values = await manualForm.validateFields();
+    if (manualJob)
+      await act(() =>
+        contentApi.completeManual(manualJob.id, values.external_post_id),
+      );
+    setManualJob(null);
+    manualForm.resetFields();
+  }
+  async function saveMetric() {
+    const values = await metricForm.validateFields();
+    if (metricJob) await act(() => contentApi.addMetric(metricJob.id, values));
+    setMetricJob(null);
+    metricForm.resetFields();
+  }
+  return (
+    <main>
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">PUBLISH MANAGEMENT</p>
+          <h1>发布管理</h1>
+          <p>统一处理内容审批、平台发布、失败重试和效果数据回收。</p>
+        </div>
+        <Button icon={<ReloadOutlined />} onClick={load}>
+          刷新
+        </Button>
+      </div>
+      {error && (
+        <Alert
+          type="error"
+          message={error}
+          showIcon
+          closable
+          onClose={() => setError("")}
+        />
+      )}
+      <div className="publish-stat-grid">
+        <Card>
+          <Statistic title="待审批" value={counts.pending} />
+        </Card>
+        <Card>
+          <Statistic title="等待人工发布" value={counts.manual} />
+        </Card>
+        <Card>
+          <Statistic title="已发布" value={counts.published} />
+        </Card>
+        <Card>
+          <Statistic
+            title="失败任务"
+            value={counts.failed}
+            valueStyle={counts.failed ? { color: "#cf1322" } : undefined}
+          />
+        </Card>
+      </div>
+      <Card
+        className="publish-table-card"
+        title="发布任务"
+        extra={
+          <Segmented
+            value={filter}
+            onChange={(v) => setFilter(String(v))}
+            options={[
+              { label: "全部", value: "all" },
+              { label: "待审批", value: "pending" },
+              { label: "人工发布", value: "awaiting_manual_publish" },
+              { label: "已发布", value: "published" },
+              { label: "失败", value: "failed" },
+            ]}
+          />
+        }
+      >
+        <Table<PublishJob>
+          rowKey="id"
+          loading={loading}
+          dataSource={filtered}
+          scroll={{ x: 1050 }}
+          pagination={{ pageSize: 10, showTotal: (total) => `共 ${total} 条` }}
+          columns={[
+            {
+              title: "发布内容",
+              dataIndex: "content_title",
+              width: 260,
+              ellipsis: true,
+              render: (value, row) => (
+                <div className="publish-content">
+                  <b>{value || "未命名内容"}</b>
+                  <small>
+                    {channelMap[row.channel || ""] || row.channel || "未知平台"}{" "}
+                    · {row.account_name || "未知账号"}
+                  </small>
+                </div>
+              ),
+            },
+            {
+              title: "发布方式",
+              dataIndex: "account_mode",
+              width: 100,
+              render: (value) => (
+                <Tag>{value === "manual" ? "人工" : "模拟自动"}</Tag>
+              ),
+            },
+            {
+              title: "状态",
+              dataIndex: "status",
+              width: 130,
+              render: (value) => {
+                const status = statusMap[value] || {
+                  text: value,
+                  color: "default",
+                };
+                return <Tag color={status.color}>{status.text}</Tag>;
+              },
+            },
+            {
+              title: "发布时间",
+              width: 180,
+              render: (_, row) =>
+                row.published_at
+                  ? new Date(row.published_at).toLocaleString("zh-CN")
+                  : row.scheduled_at
+                    ? new Date(row.scheduled_at).toLocaleString("zh-CN")
+                    : "审批后立即处理",
+            },
+            {
+              title: "重试",
+              width: 80,
+              render: (_, row) => `${row.retry_count}/${row.max_retries}`,
+            },
+            {
+              title: "平台结果",
+              dataIndex: "external_post_id",
+              ellipsis: true,
+              render: (value) =>
+                value ? (
+                  <Tooltip title={value}>
+                    <span>{value}</span>
+                  </Tooltip>
+                ) : (
+                  "—"
+                ),
+            },
+            {
+              title: "操作",
+              fixed: "right",
+              width: 250,
+              render: (_, row) => (
+                <Space wrap>
+                  {can("publish:approve") && row.approval_status === "pending" && (
+                    <>
+                      <Button
+                        type="primary"
+                        size="small"
+                        icon={<CheckOutlined />}
+                        onClick={() =>
+                          act(() =>
+                            contentApi.decidePublishJob(row.id, "approve"),
+                          )
+                        }
+                      >
+                        批准
+                      </Button>
+                      <Button
+                        size="small"
+                        danger
+                        icon={<CloseOutlined />}
+                        onClick={() =>
+                          act(() =>
+                            contentApi.decidePublishJob(
+                              row.id,
+                              "reject",
+                              "运营人员拒绝",
+                            ),
+                          )
+                        }
+                      >
+                        拒绝
+                      </Button>
+                    </>
+                  )}
+                  {can("publish:execute") && row.status === "approved" && (
+                    <Button
+                      type="primary"
+                      size="small"
+                      onClick={() =>
+                        act(() => contentApi.executePublishJob(row.id))
+                      }
+                    >
+                      执行
+                    </Button>
+                  )}
+                  {can("publish:execute") && row.status === "awaiting_manual_publish" && (
+                    <Button
+                      type="primary"
+                      size="small"
+                      icon={<CloudUploadOutlined />}
+                      onClick={() => setManualJob(row)}
+                    >
+                      确认发布
+                    </Button>
+                  )}
+                  {can("publish:execute") && row.status === "failed" && (
+                    <Button
+                      size="small"
+                      danger
+                      onClick={() =>
+                        act(() => contentApi.retryPublishJob(row.id))
+                      }
+                    >
+                      重试
+                    </Button>
+                  )}
+                  {can("publish:metrics") && row.status === "published" && (
+                    <Button size="small" onClick={() => setMetricJob(row)}>
+                      录入数据
+                    </Button>
+                  )}
+                </Space>
+              ),
+            },
+          ]}
+        />
+      </Card>
+      <Modal
+        title="确认人工发布完成"
+        open={!!manualJob}
+        onCancel={() => setManualJob(null)}
+        onOk={completeManual}
+        okText="确认完成"
+      >
+        <Alert
+          type="info"
+          showIcon
+          message="请先在平台完成发布，再填写平台内容 ID 或内容链接。"
+        />
+        <Form
+          form={manualForm}
+          layout="vertical"
+          className="publish-modal-form"
+        >
+          <Form.Item
+            label="平台内容 ID 或 URL"
+            name="external_post_id"
+            rules={[{ required: true, message: "请填写发布结果" }]}
+          >
+            <Input placeholder="例如：https://平台内容地址" />
+          </Form.Item>
+        </Form>
+      </Modal>
+      <Modal
+        title="录入内容效果数据"
+        open={!!metricJob}
+        onCancel={() => setMetricJob(null)}
+        onOk={saveMetric}
+        okText="保存数据"
+      >
+        <Form
+          form={metricForm}
+          layout="vertical"
+          className="metric-form"
+          initialValues={{
+            views: 0,
+            likes: 0,
+            favorites: 0,
+            comments: 0,
+            shares: 0,
+            follower_gain: 0,
+          }}
+        >
+          {[
+            ["views", "阅读/曝光"],
+            ["likes", "点赞"],
+            ["favorites", "收藏"],
+            ["comments", "评论"],
+            ["shares", "分享"],
+            ["follower_gain", "粉丝增长"],
+          ].map(([name, label]) => (
+            <Form.Item
+              key={name}
+              name={name}
+              label={label}
+              rules={[{ required: true }]}
+            >
+              <InputNumber
+                min={name === "follower_gain" ? undefined : 0}
+                precision={0}
+              />
+            </Form.Item>
+          ))}
+        </Form>
+      </Modal>
+    </main>
+  );
+}

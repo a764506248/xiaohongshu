@@ -1,0 +1,23 @@
+.prompt-page {
+  padding: 24px 28px 40px !important;
+}
+.prompt-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+.prompt-heading h1 {
+  font-size: 24px;
+  margin: 0 0 6px;
+}
+.prompt-page .ant-table {
+  border: 1px solid #edf0f2;
+  border-radius: 8px;
+}
+.prompt-page .ant-table-cell small {
+  display: block;
+  color: #8c8c8c;
+  margin-top: 5px;
+  font-family: monospace;
+}

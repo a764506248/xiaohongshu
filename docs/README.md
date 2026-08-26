@@ -117,6 +117,14 @@ frontend/src/pages/TaskDetail.tsx
 
 ## 当前实现进度
 
+### 本地后台登录
+
+- 地址：`http://localhost:5173/login`
+- 默认用户名：`admin`
+- 默认密码：`admin123`
+- 正式部署前请在 `backend/.env` 修改 `AUTH_SECRET_KEY` 和默认管理员密码。
+- 除登录和健康检查外，业务 API 均要求 `Authorization: Bearer <token>`。
+
 | 阶段 | 状态 | 当前能力 |
 |---|---|---|
 | 第一期 | 已完成 | 任务、选题、文章版本、人工审核、LangGraph 持久化 |

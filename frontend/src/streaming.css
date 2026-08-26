@@ -1,0 +1,77 @@
+.stream-progress {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px 14px;
+  align-items: center;
+  margin: 0 0 20px;
+  padding: 14px 18px;
+  border: 1px solid #f2c7bc;
+  border-radius: 10px;
+  background: #fff8f5;
+}
+.stream-pulse {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #ef5b3f;
+  box-shadow: 0 0 0 0 #ef5b3f66;
+  animation: stream-pulse 1.4s infinite;
+}
+.stream-completed {
+  border-color: #b8dfcc;
+  background: #f3fbf7;
+}
+.stream-completed .stream-pulse {
+  background: #21a876;
+  animation: none;
+  box-shadow: 0 0 0 4px #21a87620;
+}
+.stream-error {
+  border-color: #f0b7ad;
+  background: #fff3f1;
+}
+.stream-error .stream-pulse {
+  background: #d63f2f;
+  animation: none;
+}
+.stream-progress strong,
+.stream-progress small {
+  display: block;
+}
+.stream-progress small {
+  margin-top: 3px;
+  color: #777;
+}
+.stream-steps {
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.stream-steps span {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #f3eee9;
+  color: #71665f;
+  font-size: 11px;
+}
+.stream-steps .stream-step-node_started {
+  color: #b7432f;
+  background: #ffe8e1;
+}
+.stream-steps .stream-step-node_completed {
+  color: #167052;
+  background: #e4f5ec;
+}
+.stream-steps .stream-step-node_error {
+  color: #a52f24;
+  background: #fde4df;
+}
+@keyframes stream-pulse {
+  70% {
+    box-shadow: 0 0 0 8px #ef5b3f00;
+  }
+  100% {
+    box-shadow: 0 0 0 0 #ef5b3f00;
+  }
+}

@@ -172,13 +172,35 @@ def analytics_summary(db: Session) -> dict:
         func.coalesce(func.sum(PostMetric.likes + PostMetric.favorites + PostMetric.comments + PostMetric.shares), 0),
         func.coalesce(func.avg(PostMetric.performance_score), 0),
     )).one()
-    calls, cost = db.execute(select(func.count(ModelUsageEvent.id), func.coalesce(func.sum(ModelUsageEvent.estimated_cost), 0))).one()
+    calls, cost, input_tokens, output_tokens, latency = db.execute(select(
+        func.count(ModelUsageEvent.id), func.coalesce(func.sum(ModelUsageEvent.estimated_cost), 0),
+        func.coalesce(func.sum(ModelUsageEvent.input_tokens), 0), func.coalesce(func.sum(ModelUsageEvent.output_tokens), 0),
+        func.coalesce(func.sum(ModelUsageEvent.latency_ms), 0),
+    )).one()
     signals = list(db.scalars(select(PreferenceSignal).order_by(PreferenceSignal.weight.desc()).limit(10)))
-    return {"published_posts": published, "total_views": totals[0], "total_interactions": totals[1], "average_score": round(float(totals[2]), 2), "model_calls": calls, "estimated_model_cost": float(cost), "top_signals": signals}
+    return {"published_posts": published, "total_views": totals[0], "total_interactions": totals[1], "average_score": round(float(totals[2]), 2), "model_calls": calls, "total_input_tokens": input_tokens, "total_output_tokens": output_tokens, "total_tokens": input_tokens + output_tokens, "total_latency_ms": latency, "estimated_model_cost": float(cost), "top_signals": signals}
+
+
+def token_usage_report(db: Session, start_at: datetime, end_at: datetime, granularity: str) -> dict:
+    rows = list(db.scalars(select(ModelUsageEvent).where(
+        ModelUsageEvent.created_at >= start_at,
+        ModelUsageEvent.created_at <= end_at,
+    ).order_by(ModelUsageEvent.created_at)))
+    formats = {"day": "%Y-%m-%d", "month": "%Y-%m", "year": "%Y"}
+    buckets: dict[str, dict] = {}
+    for row in rows:
+        period = row.created_at.strftime(formats[granularity])
+        point = buckets.setdefault(period, {"period": period, "calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "latency_ms": 0})
+        point["calls"] += 1
+        point["input_tokens"] += row.input_tokens
+        point["output_tokens"] += row.output_tokens
+        point["total_tokens"] += row.input_tokens + row.output_tokens
+        point["latency_ms"] += row.latency_ms
+    points = list(buckets.values())
+    return {"granularity": granularity, "start_at": start_at, "end_at": end_at, "calls": sum(p["calls"] for p in points), "input_tokens": sum(p["input_tokens"] for p in points), "output_tokens": sum(p["output_tokens"] for p in points), "total_tokens": sum(p["total_tokens"] for p in points), "points": points}
 
 
 def duplicate_topics(db: Session, title: str, limit: int = 5) -> list[dict]:
     rows = list(db.scalars(select(ChannelVariant).order_by(ChannelVariant.created_at.desc()).limit(100)))
     matches = [{"title": row.title, "channel": row.channel, "similarity": round(SequenceMatcher(None, title.lower(), row.title.lower()).ratio(), 3)} for row in rows]
     return sorted(matches, key=lambda x: x["similarity"], reverse=True)[:limit]
-

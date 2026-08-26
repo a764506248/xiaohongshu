@@ -2,7 +2,7 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -10,6 +10,12 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from app.ai.provider import get_llm_provider
 from app.api import router
+from app.auth import ensure_default_admin, get_current_user, router as auth_router
+from app.user_api import router as user_router
+from app.model_api import router as model_router
+from app.prompt_api import router as prompt_router
+from app.prompt_service import seed_system_prompts
+from app.aliyun_models import seed_model_configurations
 from app.operations_api import router as operations_router
 from app.core.config import get_settings
 from app.core.database import Base, SessionLocal, engine
@@ -23,6 +29,10 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
     settings = get_settings()
+    with SessionLocal() as db:
+        ensure_default_admin(db)
+        seed_model_configurations(db)
+        seed_system_prompts(db)
     checkpoint_context = None
     if settings.checkpoint_database_url:
         from langgraph.checkpoint.postgres import PostgresSaver
@@ -49,6 +59,10 @@ def create_app() -> FastAPI:
         ),
         openapi_tags=[
             {"name": "系统", "description": "服务健康状态和基础信息。"},
+            {"name": "用户认证", "description": "后台管理员登录和当前用户信息。"},
+            {"name": "用户权限", "description": "创建用户、启停账号、重置密码和分配 RBAC 权限。"},
+            {"name": "模型管理", "description": "查看、启停、设置默认模型并执行连通性测试。API Key 不会通过接口返回。"},
+            {"name": "Prompt 管理", "description": "管理系统和个人 Prompt、标签、模板变量及不可变版本历史。"},
             {"name": "内容任务", "description": "内容生产流程的根对象；任务状态决定前端当前展示的操作。"},
             {"name": "候选选题", "description": "调用 LLM 生成候选选题，并通过人工选择恢复 LangGraph。"},
             {"name": "文章与版本", "description": "查询 AI 文案、历史版本以及保存人工编辑版本。历史版本不会被覆盖。"},
@@ -86,8 +100,12 @@ def create_app() -> FastAPI:
     def health():
         return {"status": "ok"}
 
-    app.include_router(router)
-    app.include_router(operations_router)
+    app.include_router(auth_router)
+    app.include_router(user_router)
+    app.include_router(model_router)
+    app.include_router(prompt_router)
+    app.include_router(router, dependencies=[Depends(get_current_user)])
+    app.include_router(operations_router, dependencies=[Depends(get_current_user)])
     STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
     app.mount("/media", StaticFiles(directory=STORAGE_ROOT), name="media")
     return app

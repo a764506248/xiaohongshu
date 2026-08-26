@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -20,6 +20,23 @@ class TaskStatus(str, enum.Enum):
     waiting_article_review = "waiting_article_review"
     completed = "completed"
     failed = "failed"
+
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    username: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(120))
+    password_hash: Mapped[str] = mapped_column(Text)
+    role: Mapped[str] = mapped_column(String(30), default="admin")
+    status: Mapped[str] = mapped_column(String(30), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    permissions_csv: Mapped[str] = mapped_column("permissions", Text, default="")
+
+    @property
+    def permission_codes(self) -> list[str]:
+        return [value for value in self.permissions_csv.split(",") if value]
 
 
 class ContentTask(Base):
@@ -232,3 +249,71 @@ class ModelUsageEvent(Base):
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(30), default="success")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ModelConfiguration(Base):
+    __tablename__ = "model_configurations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    provider: Mapped[str] = mapped_column(String(50), default="aliyun_token_plan")
+    model: Mapped[str] = mapped_column(String(120))
+    capability: Mapped[str] = mapped_column(String(40))
+    protocol: Mapped[str] = mapped_column(String(40), default="dashscope_native")
+    base_url: Mapped[str] = mapped_column(String(500))
+    api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    @property
+    def has_api_key(self) -> bool:
+        return bool(self.api_key)
+
+    @property
+    def is_system(self) -> bool:
+        return self.owner_user_id is None
+
+
+class PromptTemplate(Base):
+    __tablename__ = "prompt_templates"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    prompt_key: Mapped[str] = mapped_column(String(160), index=True)
+    tags_csv: Mapped[str] = mapped_column("tags", Text, default="")
+    scene: Mapped[str] = mapped_column(String(60))
+    model_capability: Mapped[str] = mapped_column(String(40), default="text")
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(30), default="enabled")
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    versions: Mapped[list["PromptVersion"]] = relationship(cascade="all, delete-orphan", order_by="PromptVersion.version_number")
+
+    @property
+    def tags(self) -> list[str]:
+        return [tag for tag in self.tags_csv.split(",") if tag]
+
+    @property
+    def is_system(self) -> bool:
+        return self.owner_user_id is None
+
+    @property
+    def current_version(self):
+        return self.versions[-1] if self.versions else None
+
+
+class PromptVersion(Base):
+    __tablename__ = "prompt_versions"
+    __table_args__ = (UniqueConstraint("prompt_template_id", "version_number"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    prompt_template_id: Mapped[str] = mapped_column(ForeignKey("prompt_templates.id", ondelete="CASCADE"), index=True)
+    version_number: Mapped[int] = mapped_column(Integer)
+    system_prompt: Mapped[str] = mapped_column(Text, default="")
+    user_prompt_template: Mapped[str] = mapped_column(Text)
+    variables_json: Mapped[str] = mapped_column(Text, default="[]")
+    change_note: Mapped[str] = mapped_column(String(300), default="")
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

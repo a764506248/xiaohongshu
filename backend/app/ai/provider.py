@@ -1,5 +1,7 @@
 import json
 import re
+import threading
+import time
 from dataclasses import asdict, dataclass
 
 import httpx
@@ -23,7 +25,27 @@ class ArticleOutput:
     content: str
 
 
+@dataclass
+class UsageRecord:
+    provider: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    latency_ms: int
+    status: str = "success"
+
+
 class LLMProvider:
+    _usage = threading.local()
+
+    def _set_usage(self, usage: UsageRecord) -> None:
+        self._usage.value = usage
+
+    def consume_usage(self) -> UsageRecord | None:
+        usage = getattr(self._usage, "value", None)
+        self._usage.value = None
+        return usage
+
     def generate_topics(self, title: str, requirement: str, audience: str, instruction: str = "") -> list[TopicOutput]:
         raise NotImplementedError
 
@@ -35,13 +57,14 @@ class MockLLMProvider(LLMProvider):
     """Deterministic local provider. Replace through the provider interface in production."""
 
     def generate_topics(self, title: str, requirement: str, audience: str, instruction: str = "") -> list[TopicOutput]:
+        started = time.perf_counter()
         angles = [
             ("实战清单", "用清单拆解可立即执行的方法", 92),
             ("避坑指南", "总结学习和项目实践中的高频误区", 89),
             ("案例复盘", "通过完整案例呈现从问题到结果的过程", 87),
             ("工具对比", "比较常见工具的适用场景和选择标准", 84),
         ]
-        return [
+        result = [
             TopicOutput(
                 title=f"{title}：{name}",
                 summary=f"围绕“{title}”{summary}。{requirement or instruction}",
@@ -51,8 +74,11 @@ class MockLLMProvider(LLMProvider):
             )
             for name, summary, score in angles
         ]
+        self._set_usage(UsageRecord("mock", "mock-local", max(1, len(f"{title}{requirement}{audience}{instruction}") // 4), max(1, len(str(result)) // 4), int((time.perf_counter() - started) * 1000)))
+        return result
 
     def generate_article(self, topic: TopicOutput, instruction: str = "") -> ArticleOutput:
+        started = time.perf_counter()
         outline = "一、为什么值得关注\n二、核心方法\n三、实践步骤\n四、常见误区\n五、行动建议"
         content = (
             f"# {topic.title}\n\n"
@@ -65,7 +91,9 @@ class MockLLMProvider(LLMProvider):
         )
         if instruction:
             content += f"\n\n> 本次修订要求：{instruction}"
-        return ArticleOutput(title=topic.title, outline=outline, content=content)
+        result = ArticleOutput(title=topic.title, outline=outline, content=content)
+        self._set_usage(UsageRecord("mock", "mock-local", max(1, len(f"{topic}{instruction}") // 4), max(1, len(content) // 4), int((time.perf_counter() - started) * 1000)))
+        return result
 
 
 class OpenRouterLLMProvider(LLMProvider):
@@ -78,6 +106,7 @@ class OpenRouterLLMProvider(LLMProvider):
         self.timeout = timeout
 
     def _structured(self, system: str, user: str, schema_name: str, schema: dict):
+        started = time.perf_counter()
         response = httpx.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
@@ -90,7 +119,10 @@ class OpenRouterLLMProvider(LLMProvider):
             timeout=self.timeout,
         )
         response.raise_for_status()
-        message = response.json()["choices"][0]["message"]["content"]
+        payload = response.json()
+        message = payload["choices"][0]["message"]["content"]
+        usage = payload.get("usage", {})
+        self._set_usage(UsageRecord("openrouter", self.model, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)), int((time.perf_counter() - started) * 1000)))
         if isinstance(message, list):
             message = "".join(part.get("text", "") for part in message if isinstance(part, dict))
         return json.loads(message)
@@ -142,6 +174,7 @@ class SenseNovaLLMProvider(LLMProvider):
         self.timeout = timeout
 
     def _message(self, system: str, user: str, max_tokens: int = 4096) -> str:
+        started = time.perf_counter()
         response = httpx.post(
             f"{self.base_url}/messages",
             headers={
@@ -160,7 +193,10 @@ class SenseNovaLLMProvider(LLMProvider):
         if response.is_error:
             detail = response.text[:500]
             raise RuntimeError(f"SenseNova 请求失败（HTTP {response.status_code}）：{detail}")
-        blocks = response.json().get("content", [])
+        payload = response.json()
+        blocks = payload.get("content", [])
+        usage = payload.get("usage", {})
+        self._set_usage(UsageRecord("sensenova", self.model, int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0)), int((time.perf_counter() - started) * 1000)))
         text = "".join(block.get("text", "") for block in blocks if block.get("type") == "text")
         if not text:
             raise RuntimeError("SenseNova 响应中没有文本内容")

@@ -5,12 +5,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.auth import require_permission
 from app.models import ChannelAccount, ChannelVariant, ModelUsageEvent, PostMetric, PreferenceSignal, PublishAttempt, PublishJob
-from app.operations import analytics_summary, create_channel_variants, create_publish_job, duplicate_topics, execute_job, process_due_jobs, save_metric, update_variant
+from app.operations import analytics_summary, create_channel_variants, create_publish_job, duplicate_topics, execute_job, process_due_jobs, save_metric, token_usage_report, update_variant
 from app.schemas import (
     AnalyticsSummary, ChannelAccountCreate, ChannelAccountRead, ChannelVariantRead,
     ChannelVariantUpdate, ManualPublishComplete, MetricCreate, MetricRead, ModelUsageRead,
-    PreferenceSignalRead, PublishDecision, PublishJobCreate, PublishJobRead, TopicDuplicateRead,
+    PreferenceSignalRead, PublishDecision, PublishJobCreate, PublishJobRead, TokenUsageReport, TopicDuplicateRead,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -50,20 +51,29 @@ def edit_variant(variant_id: str, data: ChannelVariantUpdate, db: Session = Depe
 
 
 @router.post("/publish-jobs", response_model=PublishJobRead, status_code=201, tags=["发布任务"], summary="创建发布任务")
-def add_publish_job(data: PublishJobCreate, db: Session = Depends(get_db)):
+def add_publish_job(data: PublishJobCreate, db: Session = Depends(get_db), _=Depends(require_permission("publish:execute"))):
     return create_publish_job(db, data)
 
 
 @router.get("/publish-jobs", response_model=list[PublishJobRead], tags=["发布任务"], summary="查询发布任务与排期")
-def list_publish_jobs(status: str | None = Query(default=None, description="按发布状态过滤"), db: Session = Depends(get_db)):
+def list_publish_jobs(status: str | None = Query(default=None, description="按发布状态过滤"), db: Session = Depends(get_db), _=Depends(require_permission("publish:view"))):
     query = select(PublishJob).order_by(PublishJob.scheduled_at.desc(), PublishJob.created_at.desc())
     if status:
         query = query.where(PublishJob.status == status)
-    return list(db.scalars(query))
+    jobs = list(db.scalars(query))
+    result = []
+    for job in jobs:
+        variant = db.get(ChannelVariant, job.channel_variant_id)
+        account = db.get(ChannelAccount, job.channel_account_id)
+        item = {column.name: getattr(job, column.name) for column in PublishJob.__table__.columns}
+        item.update(channel=variant.channel if variant else None, content_title=variant.title if variant else None,
+                    account_name=account.name if account else None, account_mode=account.mode if account else None)
+        result.append(item)
+    return result
 
 
 @router.post("/publish-jobs/{job_id}/decision", response_model=PublishJobRead, tags=["发布任务"], summary="审批发布任务")
-def decide_publish_job(job_id: str, data: PublishDecision, db: Session = Depends(get_db)):
+def decide_publish_job(job_id: str, data: PublishDecision, db: Session = Depends(get_db), _=Depends(require_permission("publish:approve"))):
     job = db.get(PublishJob, job_id)
     if not job:
         raise HTTPException(404, "发布任务不存在")
@@ -75,7 +85,7 @@ def decide_publish_job(job_id: str, data: PublishDecision, db: Session = Depends
 
 
 @router.post("/publish-jobs/{job_id}/execute", response_model=PublishJobRead, tags=["发布任务"], summary="立即执行发布任务")
-def run_publish_job(job_id: str, db: Session = Depends(get_db)):
+def run_publish_job(job_id: str, db: Session = Depends(get_db), _=Depends(require_permission("publish:execute"))):
     job = db.get(PublishJob, job_id)
     if not job:
         raise HTTPException(404, "发布任务不存在")
@@ -83,7 +93,7 @@ def run_publish_job(job_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/publish-jobs/{job_id}/retry", response_model=PublishJobRead, tags=["发布任务"], summary="重试失败任务")
-def retry_publish_job(job_id: str, db: Session = Depends(get_db)):
+def retry_publish_job(job_id: str, db: Session = Depends(get_db), _=Depends(require_permission("publish:execute"))):
     job = db.get(PublishJob, job_id)
     if not job:
         raise HTTPException(404, "发布任务不存在")
@@ -96,7 +106,7 @@ def retry_publish_job(job_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/publish-jobs/{job_id}/complete-manual", response_model=PublishJobRead, tags=["发布任务"], summary="确认人工发布完成")
-def complete_manual(job_id: str, data: ManualPublishComplete, db: Session = Depends(get_db)):
+def complete_manual(job_id: str, data: ManualPublishComplete, db: Session = Depends(get_db), _=Depends(require_permission("publish:execute"))):
     job = db.get(PublishJob, job_id)
     if not job:
         raise HTTPException(404, "发布任务不存在")
@@ -110,12 +120,12 @@ def complete_manual(job_id: str, data: ManualPublishComplete, db: Session = Depe
 
 
 @router.post("/publish-jobs/process-due", tags=["发布任务"], summary="处理到期的发布任务")
-def process_jobs(db: Session = Depends(get_db)):
+def process_jobs(db: Session = Depends(get_db), _=Depends(require_permission("publish:execute"))):
     return {"processed": process_due_jobs(db)}
 
 
 @router.post("/publish-jobs/{job_id}/metrics", response_model=MetricRead, status_code=201, tags=["运营数据"], summary="录入发布效果指标")
-def add_metric(job_id: str, data: MetricCreate, db: Session = Depends(get_db)):
+def add_metric(job_id: str, data: MetricCreate, db: Session = Depends(get_db), _=Depends(require_permission("publish:metrics"))):
     job = db.get(PublishJob, job_id)
     if not job:
         raise HTTPException(404, "发布任务不存在")
@@ -128,12 +138,12 @@ def list_metrics(job_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/analytics/summary", response_model=AnalyticsSummary, tags=["运营数据"], summary="查询运营数据总览")
-def get_analytics_summary(db: Session = Depends(get_db)):
+def get_analytics_summary(db: Session = Depends(get_db), _=Depends(require_permission("analytics:view"))):
     return analytics_summary(db)
 
 
 @router.get("/analytics/preferences", response_model=list[PreferenceSignalRead], tags=["运营数据"], summary="查询内容偏好信号")
-def get_preferences(db: Session = Depends(get_db)):
+def get_preferences(db: Session = Depends(get_db), _=Depends(require_permission("analytics:view"))):
     return list(db.scalars(select(PreferenceSignal).order_by(PreferenceSignal.weight.desc())))
 
 
@@ -143,5 +153,18 @@ def check_duplicates(title: str = Query(min_length=1, description="准备使用�
 
 
 @router.get("/analytics/model-usage", response_model=list[ModelUsageRead], tags=["运营数据"], summary="查询模型调用和成本记录")
-def get_model_usage(db: Session = Depends(get_db)):
+def get_model_usage(db: Session = Depends(get_db), _=Depends(require_permission("analytics:view"))):
     return list(db.scalars(select(ModelUsageEvent).order_by(ModelUsageEvent.created_at.desc()).limit(200)))
+
+
+@router.get("/analytics/token-usage", response_model=TokenUsageReport, tags=["运营数据"], summary="按日、月或年统计 Token 消耗")
+def get_token_usage(
+    start_at: datetime = Query(description="查询开始时间，ISO 8601"),
+    end_at: datetime = Query(description="查询结束时间，ISO 8601"),
+    granularity: str = Query(default="day", pattern="^(day|month|year)$", description="统计粒度：day、month 或 year"),
+    db: Session = Depends(get_db),
+    _=Depends(require_permission("analytics:view")),
+):
+    if end_at < start_at:
+        raise HTTPException(422, "结束时间不能早于开始时间")
+    return token_usage_report(db, start_at, end_at, granularity)

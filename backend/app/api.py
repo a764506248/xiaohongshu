@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
+import json
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -46,13 +47,41 @@ def generate_topics(task_id: str, data: GenerateRequest, request: Request, db: S
     if task.status not in {TaskStatus.draft, TaskStatus.failed, TaskStatus.waiting_topic_selection}:
         raise HTTPException(409, "当前阶段不能生成选题")
     try:
-        request.app.state.workflow.start(task.id, data.instruction)
+        request.app.state.workflow.start(task.id, data.instruction, data.llm_topic_count, data.rag_topic_count)
     except Exception as exc:
         task.status = TaskStatus.failed
         task.error_message = str(exc)
         db.commit()
         raise HTTPException(502, f"生成选题失败：{exc}") from exc
     return OperationResult(status="waiting_topic_selection", task_id=task.id)
+
+
+def sse(events):
+    # 先发送一个足够大的 SSE 注释帧，避免浏览器或反向代理等待缓冲区攒满后
+    # 才把后续的小事件交给前端。注释帧不会被 EventSource/fetch 当成业务数据。
+    yield ": stream-open " + (" " * 2048) + "\n\n"
+    try:
+        for event in events:
+            yield f"event: {event['event']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+    except Exception as exc:
+        yield f"event: error\ndata: {json.dumps({'event':'error','message':str(exc)}, ensure_ascii=False)}\n\n"
+
+
+@router.post("/content-tasks/{task_id}/generate-topics/stream", tags=["候选选题"], summary="流式生成候选选题", description="通过 SSE 持续返回主图和选题子图的节点进度。")
+def generate_topics_stream(task_id: str, data: GenerateRequest, request: Request, db: Session = Depends(get_db)):
+    task = get_task_or_404(db, task_id)
+    if task.status not in {TaskStatus.draft, TaskStatus.failed, TaskStatus.waiting_topic_selection}:
+        raise HTTPException(409, "当前阶段不能生成选题")
+    events = request.app.state.workflow.start_stream(task.id, data.instruction, data.llm_topic_count, data.rag_topic_count)
+    return StreamingResponse(
+        sse(events),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/content-tasks/{task_id}/topics", response_model=list[TopicRead], tags=["候选选题"], summary="查询候选选题", description="按 AI 评分从高到低返回当前任务的候选选题。")
@@ -77,6 +106,22 @@ def select_topic(task_id: str, data: TopicSelection, request: Request, db: Sessi
         db.commit()
         raise HTTPException(502, f"生成文案失败：{exc}") from exc
     return OperationResult(status="waiting_article_review", task_id=task.id)
+
+
+@router.post("/content-tasks/{task_id}/select-topic/stream", tags=["候选选题"], summary="流式选择选题并生成文章", description="恢复 LangGraph 后通过 SSE 返回文章生成节点进度。")
+def select_topic_stream(task_id: str, data: TopicSelection, request: Request, db: Session = Depends(get_db)):
+    task = get_task_or_404(db, task_id)
+    if task.status != TaskStatus.waiting_topic_selection:
+        raise HTTPException(409, "任务当前不在选题阶段")
+    return StreamingResponse(
+        sse(request.app.state.workflow.resume_stream(task.id, {"topic_id": data.topic_id})),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/content-tasks/{task_id}/article", response_model=ArticleRead, tags=["文章与版本"], summary="查询任务文章", description="返回文章主体和全部历史版本。current_version_id 指向当前审核或发布使用的版本。")

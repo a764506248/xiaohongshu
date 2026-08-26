@@ -52,6 +52,8 @@ class TopicSelection(BaseModel):
 
 class GenerateRequest(BaseModel):
     instruction: str = Field(default="", description="仅对本次生成生效的补充要求", examples=["优先提供实战和避坑类选题"])
+    llm_topic_count: int = Field(default=4, ge=1, le=20, description="由大模型生成的候选数量")
+    rag_topic_count: int = Field(default=3, ge=0, le=20, description="从历史选题知识库召回的候选数量")
 
 
 class ArticleVersionRead(ORMModel):
@@ -228,6 +230,10 @@ class PublishJobRead(ORMModel):
     error_message: str | None = Field(description="最近一次发布错误")
     created_at: datetime = Field(description="创建时间，UTC")
     updated_at: datetime = Field(description="更新时间，UTC")
+    channel: str | None = Field(default=None, description="发布平台")
+    content_title: str | None = Field(default=None, description="待发布内容标题")
+    account_name: str | None = Field(default=None, description="目标账号名称")
+    account_mode: str | None = Field(default=None, description="账号发布模式")
 
 
 class ManualPublishComplete(BaseModel):
@@ -285,11 +291,191 @@ class ModelUsageRead(ORMModel):
     created_at: datetime = Field(description="调用时间，UTC")
 
 
+class ModelConfigurationRead(ORMModel):
+    id: str
+    owner_user_id: str | None
+    name: str
+    provider: str
+    model: str
+    capability: str
+    protocol: str
+    base_url: str
+    has_api_key: bool
+    is_system: bool
+    enabled: bool
+    is_default: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class ModelConfigurationUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    provider: str | None = Field(default=None, min_length=1, max_length=50)
+    model: str | None = Field(default=None, min_length=1, max_length=120)
+    capability: Literal["text", "image", "image_to_video"] | None = None
+    protocol: Literal["openai_compatible", "dashscope_native", "anthropic_compatible"] | None = None
+    base_url: str | None = Field(default=None, min_length=8, max_length=500)
+    api_key: str | None = Field(default=None, max_length=1000, description="留空表示不修改现有密钥")
+    enabled: bool = True
+    is_default: bool = False
+
+
+class ModelConfigurationCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    provider: str = Field(min_length=1, max_length=50)
+    model: str = Field(min_length=1, max_length=120)
+    capability: Literal["text", "image", "image_to_video"]
+    protocol: Literal["openai_compatible", "dashscope_native", "anthropic_compatible"]
+    base_url: str = Field(min_length=8, max_length=500)
+    api_key: str = Field(min_length=1, max_length=1000)
+    enabled: bool = True
+
+
+class ModelTestRequest(BaseModel):
+    prompt: str = Field(default="一张简洁的 AI 编程课程海报，红黑配色，竖版构图", min_length=2, max_length=1000)
+
+
+class ModelTestResult(BaseModel):
+    status: str
+    model: str
+    output_url: str | None = None
+    output_text: str | None = None
+    latency_ms: int
+
+
+class PromptVersionRead(ORMModel):
+    id: str
+    version_number: int
+    system_prompt: str
+    user_prompt_template: str
+    variables_json: str
+    change_note: str
+    created_by: str | None
+    created_at: datetime
+
+
+class PromptTemplateRead(ORMModel):
+    id: str
+    owner_user_id: str | None
+    name: str
+    prompt_key: str
+    tags: list[str]
+    scene: str
+    model_capability: str
+    description: str
+    status: str
+    is_default: bool
+    is_system: bool
+    current_version: PromptVersionRead | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PromptTemplateCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    prompt_key: str = Field(min_length=2, max_length=160, pattern=r"^[a-z0-9_.-]+$")
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    scene: str = Field(min_length=1, max_length=60)
+    model_capability: Literal["text", "image", "image_to_video"] = "text"
+    description: str = Field(default="", max_length=1000)
+    system_prompt: str = ""
+    user_prompt_template: str = Field(min_length=1)
+    variables: list[str] = Field(default_factory=list)
+    change_note: str = Field(default="创建初始版本", max_length=300)
+    status: Literal["draft", "enabled", "disabled"] = "enabled"
+    is_default: bool = False
+
+
+class PromptTemplateUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    scene: str = Field(min_length=1, max_length=60)
+    model_capability: Literal["text", "image", "image_to_video"] = "text"
+    description: str = Field(default="", max_length=1000)
+    system_prompt: str = ""
+    user_prompt_template: str = Field(min_length=1)
+    variables: list[str] = Field(default_factory=list)
+    change_note: str = Field(default="更新 Prompt", max_length=300)
+    status: Literal["draft", "enabled", "disabled"] = "enabled"
+    is_default: bool = False
+
+
+class PromptRollbackRequest(BaseModel):
+    version_number: int = Field(ge=1)
+    change_note: str = Field(default="回滚历史版本", max_length=300)
+
+
+class TokenUsagePoint(BaseModel):
+    period: str = Field(description="统计周期：日为 YYYY-MM-DD，月为 YYYY-MM，年为 YYYY")
+    calls: int = Field(description="该周期模型调用次数")
+    input_tokens: int = Field(description="该周期输入 Token")
+    output_tokens: int = Field(description="该周期输出 Token")
+    total_tokens: int = Field(description="该周期总 Token")
+    latency_ms: int = Field(description="该周期累计响应耗时，毫秒")
+
+
+class TokenUsageReport(BaseModel):
+    granularity: Literal["day", "month", "year"] = Field(description="聚合粒度")
+    start_at: datetime = Field(description="查询开始时间，UTC")
+    end_at: datetime = Field(description="查询结束时间，UTC")
+    calls: int = Field(description="所选区间调用次数")
+    input_tokens: int = Field(description="所选区间输入 Token")
+    output_tokens: int = Field(description="所选区间输出 Token")
+    total_tokens: int = Field(description="所选区间总 Token")
+    points: list[TokenUsagePoint] = Field(description="按统计粒度排列的时间序列")
+
+
 class AnalyticsSummary(BaseModel):
     published_posts: int = Field(description="已发布内容数量")
     total_views: int = Field(description="累计阅读或曝光")
     total_interactions: int = Field(description="点赞、收藏、评论和分享总和")
     average_score: float = Field(description="全部指标快照的平均表现分")
     model_calls: int = Field(description="已记录模型调用次数")
+    total_input_tokens: int = Field(description="模型累计输入 Token")
+    total_output_tokens: int = Field(description="模型累计输出 Token")
+    total_tokens: int = Field(description="模型累计总 Token")
+    total_latency_ms: int = Field(description="模型调用累计耗时，毫秒")
     estimated_model_cost: float = Field(description="模型估算成本")
     top_signals: list[PreferenceSignalRead] = Field(description="当前权重最高的偏好信号")
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=80, description="登录用户名", examples=["admin"])
+    password: str = Field(min_length=6, max_length=128, description="登录密码")
+
+
+class UserRead(ORMModel):
+    id: str = Field(description="用户 UUID")
+    username: str = Field(description="登录用户名")
+    display_name: str = Field(description="页面显示名称")
+    role: str = Field(description="用户角色")
+    status: str = Field(description="账号状态")
+    created_at: datetime = Field(description="账号创建时间，UTC")
+    last_login_at: datetime | None = Field(description="最近登录时间，UTC")
+    permission_codes: list[str] = Field(description="用户拥有的权限码")
+
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=80, pattern="^[a-zA-Z0-9_.-]+$", description="登录用户名")
+    display_name: str = Field(min_length=1, max_length=120, description="显示名称")
+    password: str = Field(min_length=6, max_length=128, description="初始密码")
+    role: Literal["admin", "operator"] = Field(default="operator", description="用户角色")
+    permission_codes: list[str] = Field(default_factory=list, description="分配给用户的权限码")
+
+
+class UserUpdate(BaseModel):
+    display_name: str = Field(min_length=1, max_length=120, description="显示名称")
+    role: Literal["admin", "operator"] = Field(description="用户角色")
+    status: Literal["active", "disabled"] = Field(description="账号状态")
+    permission_codes: list[str] = Field(default_factory=list, description="分配给用户的权限码")
+
+
+class PasswordReset(BaseModel):
+    password: str = Field(min_length=6, max_length=128, description="新密码")
+
+
+class LoginResponse(BaseModel):
+    access_token: str = Field(description="后续请求使用的 Bearer 令牌")
+    token_type: str = Field(default="bearer", description="令牌类型")
+    expires_in: int = Field(description="令牌有效期，秒")
+    user: UserRead = Field(description="当前登录用户")

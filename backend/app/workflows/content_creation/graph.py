@@ -13,9 +13,10 @@ from sqlalchemy.orm import Session, sessionmaker
 # LLMProvider 隔离具体模型服务商；TopicOutput 是传给文章生成器的选题结构。
 from app.ai.provider import LLMProvider, TopicOutput
 # 数据库保存完整业务数据；LangGraph state 只保存这些数据的 ID 和路由信息。
-from app.models import Article, ArticleVersion, ContentTask, ReviewRecord, TaskStatus, TopicCandidate
+from app.models import Article, ArticleVersion, ContentTask, ModelUsageEvent, ReviewRecord, TaskStatus, TopicCandidate
 # ContentState 定义整个图运行过程中可以携带的字段。
 from app.workflows.content_creation.state import ContentState
+from app.workflows.content_creation.topic_subgraph import TopicGenerationSubgraph
 
 # 使用模块级 logger，日志格式和输出位置由 FastAPI/Uvicorn 统一控制。
 logger = logging.getLogger(__name__)
@@ -42,8 +43,10 @@ class ContentWorkflow:
         # 创建一张以 ContentState 为共享状态结构的有向图。
         builder = StateGraph(ContentState)
 
-        # 注册五个节点。字符串是图中的节点名称，第二个参数是执行该节点的方法。
-        builder.add_node("generate_topics", self.generate_topics)
+        # 选题生成本身是一张子图：LLM 生成、RAG 召回、合并排序、持久化都可独立迭代。
+        self.topic_generation = TopicGenerationSubgraph(session_factory, llm)
+        # 主图仍使用 generate_topics 这个稳定节点名，后续主流程无需感知子图内部变化。
+        builder.add_node("generate_topics", self.topic_generation.graph)
         builder.add_node("select_topic", self.select_topic)
         builder.add_node("generate_article", self.generate_article)
         builder.add_node("review_article", self.review_article)
@@ -81,7 +84,7 @@ class ContentWorkflow:
         """
         return {"configurable": {"thread_id": thread_id}}
 
-    def start(self, task_id: str, instruction: str = ""):
+    def start(self, task_id: str, instruction: str = "", llm_topic_count: int = 4, rag_topic_count: int = 3):
         """从 START 启动一个全新的内容工作流。"""
         # 每次重新启动都生成新 thread_id，避免错误恢复到旧工作流。
         thread_id = f"content-task:{task_id}:{uuid.uuid4()}"
@@ -97,12 +100,121 @@ class ContentWorkflow:
             db.commit()
         # 初始 state 只存任务 ID 和本次补充指令；随后从 START 开始执行。
         try:
-            result = self.graph.invoke({"task_id": task_id, "instruction": instruction}, self.config(thread_id))
+            result = self.graph.invoke({
+                "task_id": task_id,
+                "instruction": instruction,
+                "llm_topic_count": llm_topic_count,
+                "rag_topic_count": rag_topic_count,
+            }, self.config(thread_id))
             logger.info("content_workflow.paused_or_finished task_id=%s thread_id=%s", task_id, thread_id)
             return result
         except Exception:
             logger.exception("content_workflow.start_failed task_id=%s thread_id=%s", task_id, thread_id)
             raise
+
+    def start_stream(self, task_id: str, instruction: str = "", llm_topic_count: int = 4, rag_topic_count: int = 3):
+        """启动主图并逐节点产生事件，包含选题子图内部节点。"""
+        thread_id = f"content-task:{task_id}:{uuid.uuid4()}"
+        with self.session_factory() as db:
+            task = db.get(ContentTask, task_id)
+            if not task:
+                raise ValueError("内容任务不存在")
+            task.workflow_thread_id = thread_id
+            db.commit()
+        initial = {"task_id": task_id, "instruction": instruction, "llm_topic_count": llm_topic_count, "rag_topic_count": rag_topic_count}
+        yield {"event": "started", "node": "START", "message": "工作流已启动"}
+        try:
+            # tasks 模式会在节点开始和结束时分别发事件；updates 只在节点结束后发，
+            # LLM 调用期间前端会长时间没有反馈，看起来像一次性返回。
+            for namespace, task_event in self.graph.stream(
+                initial,
+                self.config(thread_id),
+                stream_mode="tasks",
+                subgraphs=True,
+            ):
+                yield self._task_stream_event(namespace, task_event)
+        except Exception as exc:
+            self._mark_failed(task_id, exc)
+            raise
+        yield {"event": "completed", "node": "select_topic", "message": "候选选题已生成，等待人工选择"}
+
+    def resume_stream(self, task_id: str, value: dict):
+        """从 interrupt 恢复，并逐节点返回后续执行事件。"""
+        with self.session_factory() as db:
+            task = db.get(ContentTask, task_id)
+            if not task or not task.workflow_thread_id:
+                raise ValueError("任务没有可恢复的工作流")
+            thread_id = task.workflow_thread_id
+        yield {"event": "started", "node": "resume", "message": "已恢复工作流"}
+        try:
+            for namespace, task_event in self.graph.stream(
+                Command(resume=value),
+                self.config(thread_id),
+                stream_mode="tasks",
+                subgraphs=True,
+            ):
+                yield self._task_stream_event(namespace, task_event)
+        except Exception as exc:
+            self._mark_failed(task_id, exc)
+            raise
+        yield {"event": "completed", "node": "review_article", "message": "文案已生成，等待人工审核"}
+
+    @staticmethod
+    def _node_message(node: str) -> str:
+        return {
+            "initialize": "正在初始化任务",
+            "generate_llm_topics": "正在调用 LLM 生成选题",
+            "retrieve_rag_topics": "正在从知识库召回选题",
+            "merge_and_rank_topics": "正在合并、去重和排序",
+            "persist_topics": "正在保存候选选题",
+            "generate_topics": "选题子图执行完成",
+            "select_topic": "已确认选题",
+            "generate_article": "正在生成文章",
+            "review_article": "文章已进入审核阶段",
+            "__interrupt__": "工作流等待人工操作",
+        }.get(node, f"正在执行 {node}")
+
+    @classmethod
+    def _task_stream_event(cls, namespace, task_event: dict) -> dict:
+        """把 LangGraph task 开始/结束事件转换成前端使用的轻量 SSE 事件。"""
+        node = task_event.get("name", "unknown")
+        finished = "result" in task_event or "error" in task_event
+        if finished:
+            error = task_event.get("error")
+            message = f"{node} 执行失败：{error}" if error else f"{cls._node_label(node)}已完成"
+            event_name = "node_error" if error else "node_completed"
+        else:
+            message = cls._node_message(node)
+            event_name = "node_started"
+        return {
+            "event": event_name,
+            "node": node,
+            "namespace": list(namespace),
+            "message": message,
+        }
+
+    @staticmethod
+    def _node_label(node: str) -> str:
+        return {
+            "initialize": "任务初始化",
+            "generate_llm_topics": "LLM 选题生成",
+            "retrieve_rag_topics": "知识库选题召回",
+            "merge_and_rank_topics": "选题合并与排序",
+            "persist_topics": "候选选题保存",
+            "generate_topics": "选题子图",
+            "select_topic": "选题确认",
+            "generate_article": "文章生成",
+            "review_article": "文章审核准备",
+        }.get(node, node)
+
+    def _mark_failed(self, task_id: str, exc: Exception) -> None:
+        with self.session_factory() as db:
+            task = db.get(ContentTask, task_id)
+            if task:
+                task.status = TaskStatus.failed
+                task.current_stage = "failed"
+                task.error_message = str(exc)
+                db.commit()
 
     def resume(self, task_id: str, value: dict):
         """把人工选择或审核结果送回 interrupt，并继续执行原工作流。"""
@@ -128,37 +240,6 @@ class ContentWorkflow:
         except Exception:
             logger.exception("content_workflow.resume_failed task_id=%s thread_id=%s", task_id, thread_id)
             raise
-
-    def generate_topics(self, state: ContentState) -> ContentState:
-        """节点一：调用 LLM 生成候选选题，并把候选项保存到数据库。"""
-        logger.info("content_workflow.node_enter node=generate_topics task_id=%s", state["task_id"])
-        with self.session_factory() as db:
-            task = db.get(ContentTask, state["task_id"])
-            if not task:
-                raise ValueError("内容任务不存在")
-            # 先写入“生成中”，前端可以据此显示加载状态。
-            task.status = TaskStatus.generating_topics
-            task.current_stage = "generating_topics"
-            # 新一次执行开始时清除旧错误。
-            task.error_message = None
-            # 重新生成选题时先删除该任务之前的候选项，避免新旧候选混在一起。
-            db.query(TopicCandidate).filter(TopicCandidate.content_task_id == task.id).delete()
-            # 将任务主题、要求、读者和本次指令交给统一 LLM 接口。
-            outputs = self.llm.generate_topics(task.title, task.requirement, task.target_audience, state.get("instruction", ""))
-            # 模型返回多个结构化 TopicOutput，这里逐条转换成数据库记录。
-            for output in outputs:
-                db.add(TopicCandidate(content_task_id=task.id, **output.__dict__))
-            # 候选项已经准备好，业务状态切换为“等待人工选题”。
-            task.status = TaskStatus.waiting_topic_selection
-            task.current_stage = "waiting_topic_selection"
-            db.commit()
-            logger.info(
-                "content_workflow.node_complete node=generate_topics task_id=%s topic_count=%d next=select_topic",
-                task.id,
-                len(outputs),
-            )
-        # 这个节点没有新增图状态字段，所以原样返回 state。
-        return state
 
     def select_topic(self, state: ContentState) -> ContentState:
         """节点二：暂停工作流，等待用户选择一个候选选题。"""
@@ -212,6 +293,7 @@ class ContentWorkflow:
             output = self.llm.generate_article(
                 TopicOutput(topic.title, topic.summary, topic.target_reader, topic.reason, topic.score), instruction
             )
+            self._save_usage(db, task.id, "generate_article")
 
             # 一项内容任务只有一个 Article 主体，但可以拥有多个不可变版本。
             article = db.scalar(select(Article).where(Article.content_task_id == task.id))
@@ -292,3 +374,26 @@ class ContentWorkflow:
         logger.info("content_workflow.node_complete node=finish task_id=%s next=END", state["task_id"])
         # finish 后沿固定边到 END，此返回值作为工作流最终 state。
         return state
+
+    def _save_usage(self, db: Session, task_id: str, operation: str) -> None:
+        """将刚完成的模型调用统计写入业务库，正文和 Prompt 不进入统计表。"""
+        usage = self.llm.consume_usage()
+        if not usage:
+            logger.warning("llm_usage.missing task_id=%s operation=%s", task_id, operation)
+            return
+        db.add(ModelUsageEvent(
+            content_task_id=task_id,
+            provider=usage.provider,
+            model=usage.model,
+            operation=operation,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            estimated_cost=0,
+            latency_ms=usage.latency_ms,
+            status=usage.status,
+        ))
+        logger.info(
+            "llm_usage.recorded task_id=%s operation=%s model=%s input_tokens=%d output_tokens=%d total_tokens=%d latency_ms=%d",
+            task_id, operation, usage.model, usage.input_tokens, usage.output_tokens,
+            usage.input_tokens + usage.output_tokens, usage.latency_ms,
+        )

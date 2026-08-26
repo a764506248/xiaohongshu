@@ -1,0 +1,143 @@
+/* 后台内容区统一采用紧凑、自适应布局。 */
+.admin-content {
+  min-width: 0;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 6px 6px 12px;
+}
+
+.admin-sider + .ant-layout {
+  margin-left: 196px;
+}
+.admin-sider.ant-layout-sider-collapsed + .ant-layout {
+  margin-left: 68px;
+}
+.admin-logo {
+  height: 60px;
+  gap: 9px;
+  padding: 0 14px;
+}
+.admin-logo > span {
+  width: 32px;
+  height: 32px;
+  border-radius: 7px;
+  font-size: 13px;
+}
+.admin-logo b {
+  font-size: 14px;
+}
+.admin-sider .ant-menu {
+  padding: 10px 7px;
+}
+.admin-sider .ant-menu-item {
+  height: 38px;
+  margin-block: 3px;
+  padding-inline: 13px !important;
+  font-size: 13px;
+  line-height: 38px;
+}
+.admin-header {
+  height: 56px !important;
+  padding: 0 16px !important;
+}
+
+.content-surface {
+  min-width: 0;
+  min-height: calc(100vh - 78px);
+  overflow: hidden;
+}
+
+.content-surface main,
+.prompt-page,
+.model-page,
+.task-list-page {
+  padding: 16px 10px 26px !important;
+}
+
+/* 列表页优先把横向空间交给表格，避免桌面端两侧出现大块空白。 */
+.task-list-page {
+  padding-inline: 10px !important;
+}
+
+.content-surface .page-heading {
+  margin-bottom: 18px;
+}
+.content-surface .page-heading h1,
+.prompt-heading h1,
+.model-heading h1,
+.task-list-toolbar h1 {
+  font-size: 24px;
+}
+.content-surface .page-heading p {
+  font-size: 13px;
+}
+.content-surface .ant-card-body {
+  padding: 18px;
+}
+.content-surface .ant-card-head {
+  min-height: 48px;
+  padding-inline: 18px;
+}
+.content-surface .ant-table-thead > tr > th,
+.content-surface .ant-table-tbody > tr > td {
+  padding: 10px 12px;
+}
+.publish-stat-grid {
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.publish-stat-grid .ant-statistic-content {
+  font-size: 24px;
+}
+.publish-stat-grid .ant-statistic-title {
+  font-size: 13px;
+}
+
+.content-surface .ant-table-wrapper,
+.content-surface .ant-spin-nested-loading,
+.content-surface .ant-spin-container {
+  width: 100%;
+  min-width: 0;
+}
+
+.content-surface .ant-table-container,
+.content-surface .ant-table-content {
+  overflow-x: auto !important;
+}
+
+.content-surface .ant-table-content > table {
+  width: 100% !important;
+  min-width: 760px;
+}
+
+.prompt-heading,
+.model-heading,
+.task-list-toolbar {
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+@media (max-width: 800px) {
+  .admin-content {
+    padding: 4px;
+  }
+
+  .content-surface main,
+  .prompt-page,
+  .model-page,
+  .task-list-page {
+    padding: 14px 12px 22px !important;
+  }
+
+  .content-surface .ant-table-content > table {
+    min-width: 680px;
+  }
+
+  .prompt-heading,
+  .model-heading,
+  .task-list-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}

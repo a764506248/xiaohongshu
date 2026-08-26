@@ -14,6 +14,8 @@ from sqlalchemy.orm import Session, selectinload
 from app.models import (
     Article, ArticleVersion, ContentTask, ImagePage, ImageVersion, TaskStatus, XiaohongshuPackage,
 )
+from app.aliyun_models import default_image_model, generate_image
+from app.core.config import get_settings
 
 STORAGE_ROOT = Path(__file__).resolve().parents[1] / "storage" / "images"
 FONT_CANDIDATES = [
@@ -121,7 +123,18 @@ def render_page(db: Session, page: ImagePage, source_type: str = "generated") ->
     next_number = (db.scalar(select(func.max(ImageVersion.version_number)).where(ImageVersion.page_id == page.id)) or 0) + 1
     relative = f"{page.package_id}/{page.id}-v{next_number}.png"
     output = STORAGE_ROOT / relative
-    digest, width, height = LocalImageProvider().render(page, output)
+    settings = get_settings()
+    model = default_image_model(db) if settings.app_env != "test" and settings.aliyun_model_api_key else None
+    if model:
+        prompt = f"{page.visual_description}。竖版社交媒体知识卡片。标题：{page.title}。正文要点：{page.body}"
+        image_bytes, _, _ = generate_image(model, prompt)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        generated = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        generated.save(output, format="PNG", optimize=True)
+        digest, width, height = hashlib.sha256(output.read_bytes()).hexdigest(), generated.width, generated.height
+        source_type = f"{source_type}:{model.model}"
+    else:
+        digest, width, height = LocalImageProvider().render(page, output)
     version = ImageVersion(
         page_id=page.id, version_number=next_number, file_path=str(output), public_url=f"/media/{relative}",
         source_type=source_type, width=width, height=height, file_hash=digest,
@@ -203,4 +216,3 @@ def export_package(package: XiaohongshuPackage) -> io.BytesIO:
         archive.writestr("copy.txt", f"{package.title}\n\n{package.body}\n\n{package.tags}")
     stream.seek(0)
     return stream
-
