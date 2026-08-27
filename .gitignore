@@ -8,6 +8,8 @@ __pycache__/
 .coverage
 backend/.venv/
 backend/storage/images/
+backend/storage/xhs-login/
 frontend/node_modules/
 frontend/dist/
+xhs-login/node_modules/
 *.tsbuildinfo

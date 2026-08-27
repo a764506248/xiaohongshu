@@ -1,12 +1,13 @@
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 import json
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.media import create_package, export_package, get_package, render_page, save_upload
-from app.models import Article, ArticleVersion, ContentTask, ImagePage, ReviewRecord, TaskStatus, TopicCandidate, XiaohongshuPackage
+from app.media import create_package, export_package, find_package, get_package, render_page, save_upload
+from app.models import Article, ArticleVersion, ContentTask, ImagePage, ModelConfiguration, ReviewRecord, TaskStatus, TopicCandidate, User, XiaohongshuPackage
+from app.auth import get_current_user
 from app.schemas import (
     ArticleRead, ArticleVersionRead, ContentTaskCreate, ContentTaskRead, ContentTaskUpdate,
     GenerateRequest, HumanEdit, ImagePageRead, ImagePageUpdate, ImageVersionRead, OperationResult,
@@ -19,7 +20,11 @@ router = APIRouter(prefix="/api/v1")
 
 
 @router.post("/content-tasks", response_model=ContentTaskRead, status_code=201, tags=["内容任务"], summary="创建内容任务", description="创建一次新的内容生产任务。创建后状态为 draft，下一步调用生成候选选题接口。")
-def create_content_task(data: ContentTaskCreate, db: Session = Depends(get_db)):
+def create_content_task(data: ContentTaskCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if data.model_configuration_id:
+        model = db.get(ModelConfiguration, data.model_configuration_id)
+        if model and user.role != "admin" and model.owner_user_id not in {None, user.id}:
+            raise HTTPException(403, "无权使用该模型配置")
     return create_task(db, data)
 
 
@@ -37,7 +42,11 @@ def get_content_task(task_id: str, db: Session = Depends(get_db)):
 
 
 @router.patch("/content-tasks/{task_id}", response_model=ContentTaskRead, tags=["内容任务"], summary="修改任务要求", description="仅 draft 或 failed 状态允许修改主题、目标受众和补充要求。")
-def patch_content_task(task_id: str, data: ContentTaskUpdate, db: Session = Depends(get_db)):
+def patch_content_task(task_id: str, data: ContentTaskUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if data.model_configuration_id:
+        model = db.get(ModelConfiguration, data.model_configuration_id)
+        if model and user.role != "admin" and model.owner_user_id not in {None, user.id}:
+            raise HTTPException(403, "无权使用该模型配置")
     return update_task(db, get_task_or_404(db, task_id), data)
 
 
@@ -147,11 +156,15 @@ def create_human_version(article_id: str, data: HumanEdit, db: Session = Depends
 
 
 @router.post("/content-tasks/{task_id}/review", response_model=ReviewRead, tags=["人工审核"], summary="提交文章审核决定", description="仅 waiting_article_review 状态可调用。支持 approve、reject、edit_and_approve 和 regenerate；相同 request_id 只处理一次。")
-def review_article(task_id: str, data: ReviewRequest, request: Request, db: Session = Depends(get_db)):
+def review_article(task_id: str, data: ReviewRequest, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     record, created = record_review(db, task, data)
     if created:
         request.app.state.workflow.resume(task.id, data.model_dump())
+        # 文章主 Graph 已经完成后再启动独立的小红书平台 Graph。放入后台任务，
+        # 让审核接口及时返回；内容包页面可以轮询查看生成结果。
+        if data.decision in {"approve", "edit_and_approve"}:
+            background_tasks.add_task(request.app.state.xiaohongshu_packaging_workflow.start, task.id)
     return record
 
 
@@ -162,13 +175,17 @@ def list_reviews(task_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/content-tasks/{task_id}/xiaohongshu-package", response_model=XiaohongshuPackageRead, tags=["小红书内容包"], summary="生成小红书内容包", description="仅审核完成的任务可调用。将当前文章版本转换为发布文案和 3～5 个图片页面；重复调用返回已有内容包。")
-def generate_xiaohongshu_package(task_id: str, db: Session = Depends(get_db)):
-    return create_package(db, task_id)
-
-
-@router.get("/content-tasks/{task_id}/xiaohongshu-package", response_model=XiaohongshuPackageRead, tags=["小红书内容包"], summary="查询小红书内容包", description="返回标题、正文、标签、图片页面及每页全部图片版本。")
-def read_xiaohongshu_package(task_id: str, db: Session = Depends(get_db)):
+def generate_xiaohongshu_package(task_id: str, request: Request, db: Session = Depends(get_db)):
+    get_task_or_404(db, task_id)
+    request.app.state.xiaohongshu_packaging_workflow.start(task_id)
+    db.expire_all()
     return get_package(db, task_id)
+
+
+@router.get("/content-tasks/{task_id}/xiaohongshu-package", response_model=XiaohongshuPackageRead | None, tags=["小红书内容包"], summary="查询小红书内容包", description="任务不存在返回 404；任务存在但尚未生成内容包时返回 200 和 null；已生成时返回完整内容包。")
+def read_xiaohongshu_package(task_id: str, db: Session = Depends(get_db)):
+    get_task_or_404(db, task_id)
+    return find_package(db, task_id)
 
 
 @router.patch("/content-tasks/{task_id}/xiaohongshu-package", response_model=XiaohongshuPackageRead, tags=["小红书内容包"], summary="修改发布文案", description="修改小红书标题、正文和话题标签，不影响文章母稿。")
@@ -196,7 +213,7 @@ def update_image_page(page_id: str, data: ImagePageUpdate, db: Session = Depends
     return next(item for item in get_package(db, package.content_task_id).pages if item.id == page_id)
 
 
-@router.post("/image-pages/{page_id}/regenerate", response_model=ImageVersionRead, tags=["图片页面"], summary="重新生成单张图片", description="使用当前文字和模板重新渲染图片，产生新的 regenerated 版本。")
+@router.post("/image-pages/{page_id}/regenerate", response_model=ImageVersionRead, tags=["图片页面"], summary="使用阿里模型重新生成单张图片", description="使用模型管理中启用的默认阿里图片模型，根据当前页面文字重新生成图片，并产生新的 regenerated 版本。")
 def regenerate_image_page(page_id: str, db: Session = Depends(get_db)):
     page = db.get(ImagePage, page_id)
     if not page:

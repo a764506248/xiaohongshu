@@ -119,8 +119,17 @@
 }
 
 @media (max-width: 800px) {
+  .admin-sider {
+    display: none !important;
+  }
+
+  .admin-sider + .ant-layout,
+  .admin-sider.ant-layout-sider-collapsed + .ant-layout {
+    margin-left: 0 !important;
+  }
+
   .admin-content {
-    padding: 4px;
+    padding: 6px;
   }
 
   .content-surface main,
@@ -131,7 +140,8 @@
   }
 
   .content-surface .ant-table-content > table {
-    min-width: 680px;
+    width: 100% !important;
+    min-width: 0 !important;
   }
 
   .prompt-heading,
@@ -140,4 +150,27 @@
     align-items: stretch;
     flex-direction: column;
   }
+
+  .task-list-toolbar > .ant-space {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .task-list-toolbar .ant-space-item,
+  .task-search {
+    min-width: 0;
+  }
+
+  .task-list-table .ant-table-thead > tr > th,
+  .task-list-table .ant-table-tbody > tr > td {
+    padding-inline: 8px;
+  }
+
+  .task-list-table .ant-table-cell:nth-last-child(1) {
+    width: 58px !important;
+  }
+}
+
+.mobile-navigation .ant-drawer-body {
+  padding: 8px;
 }

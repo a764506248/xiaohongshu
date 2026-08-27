@@ -40,6 +40,15 @@ uv run uvicorn app.main:app --reload
 
 后端地址为 `http://localhost:8000`，接口文档位于 `http://localhost:8000/docs`。
 
+小红书账号需要扫码登录时，先安装二维码登录桥接组件（仅首次需要）：
+
+```bash
+cd xhs-login
+npm install
+```
+
+后端通过本机 stdio 子进程调用 XHS MCP，无需启动 HTTP 服务，也不会开放 3000 端口。“多平台运营”中的“检测登录”会先查询 XHS MCP；未登录时自动弹出二维码，并把扫码后的 Cookie 保存到 `~/.xhs-mcp/cookies.json` 供检测和发布复用。
+
 本地开发默认使用 Docker PostgreSQL，同时保存业务数据和 LangGraph checkpoint。自动化测试使用隔离的 SQLite 与内存 checkpoint，不会修改本地开发数据。
 
 ### 3. 前端
@@ -61,3 +70,20 @@ cd frontend && npm run build
 ```
 
 本地 `.env` 默认配置 SenseNova Messages API 和 `deepseek-v4-flash`；自动化测试使用 `mock` 模型，不产生外部调用或模型费用。需要离线运行时可将 `LLM_PROVIDER` 改为 `mock`，也可切换回保留的 OpenRouter 适配器。
+
+## LangSmith 链路追踪
+
+后端已支持 LangSmith 观测 LangGraph 主图、选题子图、节点耗时、异常和任务元数据。在 `backend/.env` 中配置后重启后端：
+
+```env
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=lsv2_你的密钥
+LANGSMITH_PROJECT=xiaohongshu-content-operations
+```
+
+每条 trace 都带有 `task_id`、LangGraph `thread_id` 和任务选择的模型配置 ID。若不希望任务要求及生成内容离开服务器，可同时启用：
+
+```env
+LANGSMITH_HIDE_INPUTS=true
+LANGSMITH_HIDE_OUTPUTS=true
+```

@@ -1,12 +1,16 @@
 import json
+import logging
 import re
 import threading
 import time
 from dataclasses import asdict, dataclass
 
 import httpx
+from langsmith import traceable
 
 from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,6 +57,52 @@ class LLMProvider:
         raise NotImplementedError
 
 
+def is_retryable_model_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {402, 408, 429, 500, 502, 503, 504}
+    text = str(exc).lower()
+    return any(marker in text for marker in (
+        "http 402", "http 408", "http 429", "http 500", "http 502", "http 503", "http 504",
+        "too many requests", "rate_limit", "rate limit", "quota exceeded", "allocated quota",
+        "timed out", "timeout",
+    ))
+
+
+class FallbackLLMProvider(LLMProvider):
+    """按顺序调用文本模型，仅在限流、额度或临时服务错误时切换。"""
+
+    def __init__(self, providers: list[LLMProvider]):
+        if not providers:
+            raise RuntimeError("没有可用的文本模型")
+        self.providers = providers
+        self.active: LLMProvider | None = None
+
+    def _call(self, method: str, *args, **kwargs):
+        failures: list[str] = []
+        for index, provider in enumerate(self.providers):
+            try:
+                result = getattr(provider, method)(*args, **kwargs)
+                self.active = provider
+                if index:
+                    logger.warning("llm_fallback.succeeded method=%s fallback_index=%d provider=%s model=%s", method, index, getattr(provider, "provider_name", "unknown"), getattr(provider, "model", "unknown"))
+                return result
+            except Exception as exc:
+                failures.append(f"{getattr(provider, 'model', provider.__class__.__name__)}: {exc}")
+                if not is_retryable_model_error(exc) or index == len(self.providers) - 1:
+                    raise RuntimeError("模型调用失败；" + "；".join(failures)) from exc
+                logger.warning("llm_fallback.retry method=%s provider=%s model=%s reason=%s", method, getattr(provider, "provider_name", "unknown"), getattr(provider, "model", "unknown"), str(exc)[:200])
+        raise RuntimeError("所有文本模型均不可用")
+
+    def generate_topics(self, title: str, requirement: str, audience: str, instruction: str = "") -> list[TopicOutput]:
+        return self._call("generate_topics", title, requirement, audience, instruction)
+
+    def generate_article(self, topic: TopicOutput, instruction: str = "") -> ArticleOutput:
+        return self._call("generate_article", topic, instruction)
+
+    def consume_usage(self) -> UsageRecord | None:
+        return self.active.consume_usage() if self.active else None
+
+
 class MockLLMProvider(LLMProvider):
     """Deterministic local provider. Replace through the provider interface in production."""
 
@@ -97,14 +147,16 @@ class MockLLMProvider(LLMProvider):
 
 
 class OpenRouterLLMProvider(LLMProvider):
-    def __init__(self, base_url: str, model: str, api_key: str, timeout: float = 120):
+    def __init__(self, base_url: str, model: str, api_key: str, timeout: float = 120, provider_name: str = "openrouter"):
         if not api_key:
             raise RuntimeError("OpenRouter LLM_API_KEY 未配置")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
+        self.provider_name = provider_name
 
+    @traceable(name="openai-compatible-llm", run_type="llm")
     def _structured(self, system: str, user: str, schema_name: str, schema: dict):
         started = time.perf_counter()
         response = httpx.post(
@@ -122,7 +174,7 @@ class OpenRouterLLMProvider(LLMProvider):
         payload = response.json()
         message = payload["choices"][0]["message"]["content"]
         usage = payload.get("usage", {})
-        self._set_usage(UsageRecord("openrouter", self.model, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)), int((time.perf_counter() - started) * 1000)))
+        self._set_usage(UsageRecord(self.provider_name, self.model, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)), int((time.perf_counter() - started) * 1000)))
         if isinstance(message, list):
             message = "".join(part.get("text", "") for part in message if isinstance(part, dict))
         return json.loads(message)
@@ -145,6 +197,7 @@ class OpenRouterLLMProvider(LLMProvider):
             "你是教育培训公司的中文内容运营专家。请生成有技术含量、避免夸张承诺的候选选题。",
             f"内容方向：{title}\n目标受众：{audience}\n基础要求：{requirement}\n补充要求：{instruction}",
             "topic_candidates", schema,
+            langsmith_extra={"metadata": {"ls_provider": self.provider_name, "ls_model_name": self.model}},
         )
         return [TopicOutput(**item) for item in data["topics"]]
 
@@ -158,6 +211,7 @@ class OpenRouterLLMProvider(LLMProvider):
             "你是 AI 应用开发培训领域的中文技术作者。文章必须准确、实用、结构清晰，正文使用 Markdown。",
             f"选题信息：{json.dumps(asdict(topic), ensure_ascii=False)}\n修订要求：{instruction}",
             "article", schema,
+            langsmith_extra={"metadata": {"ls_provider": self.provider_name, "ls_model_name": self.model}},
         )
         return ArticleOutput(**data)
 
@@ -165,14 +219,16 @@ class OpenRouterLLMProvider(LLMProvider):
 class SenseNovaLLMProvider(LLMProvider):
     """Anthropic Messages compatible adapter for token.sensenova.cn."""
 
-    def __init__(self, base_url: str, model: str, api_key: str, timeout: float = 120):
+    def __init__(self, base_url: str, model: str, api_key: str, timeout: float = 120, provider_name: str = "sensenova"):
         if not api_key:
             raise RuntimeError("SenseNova LLM_API_KEY 未配置")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
+        self.provider_name = provider_name
 
+    @traceable(name="anthropic-compatible-llm", run_type="llm")
     def _message(self, system: str, user: str, max_tokens: int = 4096) -> str:
         started = time.perf_counter()
         response = httpx.post(
@@ -196,7 +252,7 @@ class SenseNovaLLMProvider(LLMProvider):
         payload = response.json()
         blocks = payload.get("content", [])
         usage = payload.get("usage", {})
-        self._set_usage(UsageRecord("sensenova", self.model, int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0)), int((time.perf_counter() - started) * 1000)))
+        self._set_usage(UsageRecord(self.provider_name, self.model, int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0)), int((time.perf_counter() - started) * 1000)))
         text = "".join(block.get("text", "") for block in blocks if block.get("type") == "text")
         if not text:
             raise RuntimeError("SenseNova 响应中没有文本内容")
@@ -223,6 +279,7 @@ class SenseNovaLLMProvider(LLMProvider):
             "请生成4个有技术含量、避免夸张承诺的候选选题。JSON格式必须为："
             '{"topics":[{"title":"", "summary":"", "target_reader":"", "reason":"", "score":90}]}。'
             f"\n内容方向：{title}\n目标受众：{audience}\n基础要求：{requirement}\n补充要求：{instruction}",
+            langsmith_extra={"metadata": {"ls_provider": self.provider_name, "ls_model_name": self.model}},
         )
         data = self._parse_json(text)
         topics = data.get("topics")
@@ -237,6 +294,7 @@ class SenseNovaLLMProvider(LLMProvider):
             "正文需要包含清晰的二级标题、实践步骤和常见误区，避免夸张承诺。"
             f"\n选题信息：{json.dumps(asdict(topic), ensure_ascii=False)}\n修订要求：{instruction}",
             max_tokens=8192,
+            langsmith_extra={"metadata": {"ls_provider": self.provider_name, "ls_model_name": self.model}},
         )
         content = text.strip()
         headings = re.findall(r"^##\s+(.+)$", content, re.MULTILINE)
@@ -261,3 +319,17 @@ def get_llm_provider() -> LLMProvider:
             settings.llm_base_url, settings.llm_model, settings.llm_api_key, settings.llm_timeout_seconds
         )
     raise RuntimeError(f"不支持的 LLM_PROVIDER：{settings.llm_provider}")
+
+
+def provider_from_model_configuration(model) -> LLMProvider:
+    """把模型管理表中的一行配置转换成内容工作流使用的统一适配器。"""
+    settings = get_settings()
+    if not model.enabled or model.capability != "text":
+        raise RuntimeError("任务选择的文本模型已停用或不可用")
+    if model.protocol == "openai_compatible":
+        key = model.api_key or (settings.openrouter_model_api_key if model.provider == "openrouter" else "")
+        return OpenRouterLLMProvider(model.base_url, model.model, key, settings.llm_timeout_seconds, model.provider)
+    if model.protocol == "anthropic_compatible":
+        key = model.api_key or (settings.llm_api_key if model.provider == settings.llm_provider else "")
+        return SenseNovaLLMProvider(model.base_url, model.model, key, settings.llm_timeout_seconds, model.provider)
+    raise RuntimeError(f"文本模型协议暂不支持内容生成：{model.protocol}")

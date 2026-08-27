@@ -4,6 +4,7 @@ os.environ["DATABASE_URL"] = "sqlite:///./xiaohongshu-test.db"
 os.environ["CHECKPOINT_DATABASE_URL"] = ""
 os.environ["LLM_PROVIDER"] = "mock"
 os.environ["APP_ENV"] = "test"
+os.environ["LANGSMITH_TRACING"] = "false"
 
 import pytest
 from fastapi.testclient import TestClient

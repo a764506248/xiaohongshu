@@ -134,3 +134,32 @@ frontend/src/pages/TaskDetail.tsx
 | 第五期 | 已完成（人工指标源） | 指标录入、表现评分、偏好信号、标题查重、模型用量接口与看板 |
 
 > 真实平台 API 需要对应平台开放权限和凭证。当前 `manual` 模式可用于正式人工运营，`mock` 模式用于本地验证自动发布链路；替换 `ChannelAdapter` 后无需改动内容生产流程。
+
+### XHS MCP 自动发布
+
+后台支持通过本机 `xhs-mcp` 服务执行小红书图文发布。该能力基于 Puppeteer，属于非官方页面自动化，请控制发布频率并自行承担账号风控风险。
+
+1. 准备 Chromium 并启动 MCP 服务：
+
+   ```bash
+   npx xhs-mcp browser
+   npx xhs-mcp mcp --mode http --port 3000
+   ```
+
+2. 在另一个终端完成登录并确认状态：
+
+   ```bash
+   npx xhs-mcp login --timeout 120
+   npx xhs-mcp status
+   ```
+
+3. 后端 `.env` 配置：
+
+   ```env
+   XHS_MCP_URL=http://127.0.0.1:3000/mcp
+   XHS_MCP_TIMEOUT_SECONDS=300
+   ```
+
+4. 在任务的“多平台运营”页面添加账号，发布方式选择“XHS MCP 自动发布”，点击“检测登录”。创建发布任务并审批后，后端会调用 `xhs_publish_content`。
+
+安全限制：MCP 地址必须是本机回环地址；发布图片必须来自 `backend/storage/images`，后台不会向 MCP 传递用户填写的任意 URL 或任意本地路径。

@@ -2,7 +2,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from app.models import Article, ArticleVersion, ContentTask, ReviewRecord, TaskStatus, TopicCandidate
+from app.models import Article, ArticleVersion, ContentTask, ModelConfiguration, ReviewRecord, TaskStatus, TopicCandidate
 from app.schemas import ContentTaskCreate, ContentTaskUpdate, HumanEdit, ReviewRequest
 
 
@@ -14,6 +14,7 @@ def get_task_or_404(db: Session, task_id: str) -> ContentTask:
 
 
 def create_task(db: Session, data: ContentTaskCreate) -> ContentTask:
+    validate_task_model(db, data.model_configuration_id)
     task = ContentTask(**data.model_dump())
     db.add(task)
     db.commit()
@@ -24,11 +25,25 @@ def create_task(db: Session, data: ContentTaskCreate) -> ContentTask:
 def update_task(db: Session, task: ContentTask, data: ContentTaskUpdate) -> ContentTask:
     if task.status not in {TaskStatus.draft, TaskStatus.failed}:
         raise HTTPException(409, "当前阶段不允许修改任务要求")
-    for key, value in data.model_dump(exclude_unset=True).items():
+    values = data.model_dump(exclude_unset=True)
+    if "model_configuration_id" in values:
+        validate_task_model(db, values["model_configuration_id"])
+    for key, value in values.items():
         setattr(task, key, value)
     db.commit()
     db.refresh(task)
     return task
+
+
+def validate_task_model(db: Session, model_id: str | None) -> ModelConfiguration | None:
+    if not model_id:
+        return None
+    model = db.get(ModelConfiguration, model_id)
+    if not model or not model.enabled or model.capability != "text":
+        raise HTTPException(422, "所选模型不存在、已停用或不是文本模型")
+    if model.protocol not in {"openai_compatible", "anthropic_compatible"}:
+        raise HTTPException(422, "所选文本模型协议暂不支持内容生成")
+    return model
 
 
 def get_article_for_task(db: Session, task_id: str) -> Article:
@@ -82,4 +97,3 @@ def record_review(db: Session, task: ContentTask, data: ReviewRequest) -> tuple[
     db.commit()
     db.refresh(record)
     return record, True
-

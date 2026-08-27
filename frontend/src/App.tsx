@@ -14,7 +14,9 @@ import {
   Avatar,
   Button,
   ConfigProvider,
+  Drawer,
   Dropdown,
+  Grid,
   Layout,
   Menu,
   Spin,
@@ -46,6 +48,9 @@ function AdminLayout() {
   const navigate = useNavigate();
   const location = useLocation();
   const [collapsed, setCollapsed] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const screens = Grid.useBreakpoint();
+  const mobile = screens.md === false;
   const selected = location.pathname.startsWith("/publishing")
     ? "/publishing"
     : location.pathname.startsWith("/analytics")
@@ -123,12 +128,30 @@ function AdminLayout() {
         />
         <div className="sider-version">{collapsed ? "V1" : "VERSION 1.0"}</div>
       </Sider>
+      <Drawer
+        title="内容运营"
+        placement="left"
+        width={260}
+        open={mobileMenuOpen}
+        onClose={() => setMobileMenuOpen(false)}
+        className="mobile-navigation"
+      >
+        <Menu
+          mode="inline"
+          selectedKeys={[selected]}
+          items={menuItems}
+          onClick={({ key }) => {
+            navigate(key);
+            setMobileMenuOpen(false);
+          }}
+        />
+      </Drawer>
       <Layout>
         <Header className="admin-header">
           <Button
             type="text"
-            icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-            onClick={() => setCollapsed(!collapsed)}
+            icon={mobile || collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+            onClick={() => mobile ? setMobileMenuOpen(true) : setCollapsed(!collapsed)}
           />
           <div className="header-right">
             <span className="environment-dot">本地环境</span>

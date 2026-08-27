@@ -187,7 +187,13 @@ export function PublishingPage() {
               dataIndex: "account_mode",
               width: 100,
               render: (value) => (
-                <Tag>{value === "manual" ? "人工" : "模拟自动"}</Tag>
+                <Tag color={value === "xhs_mcp" ? "red" : undefined}>
+                  {value === "manual"
+                    ? "人工"
+                    : value === "xhs_mcp"
+                      ? "XHS MCP"
+                      : "模拟自动"}
+                </Tag>
               ),
             },
             {
@@ -224,7 +230,13 @@ export function PublishingPage() {
               render: (value) =>
                 value ? (
                   <Tooltip title={value}>
-                    <span>{value}</span>
+                    {/^https?:\/\//.test(value) ? (
+                      <a href={value} target="_blank" rel="noreferrer">
+                        查看笔记
+                      </a>
+                    ) : (
+                      <span>{value}</span>
+                    )}
                   </Tooltip>
                 ) : (
                   "—"
@@ -301,9 +313,16 @@ export function PublishingPage() {
                     </Button>
                   )}
                   {can("publish:metrics") && row.status === "published" && (
-                    <Button size="small" onClick={() => setMetricJob(row)}>
-                      录入数据
-                    </Button>
+                    <>
+                      {row.channel === "xiaohongshu" && row.account_mode === "xhs_mcp" && (
+                        <Button size="small" onClick={() => act(() => contentApi.syncMetric(row.id))}>
+                          同步数据
+                        </Button>
+                      )}
+                      <Button size="small" onClick={() => setMetricJob(row)}>
+                        手工录入
+                      </Button>
+                    </>
                   )}
                 </Space>
               ),

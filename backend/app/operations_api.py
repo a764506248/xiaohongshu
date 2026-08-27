@@ -1,18 +1,22 @@
 from datetime import datetime
+import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.auth import require_permission
 from app.models import ChannelAccount, ChannelVariant, ModelUsageEvent, PostMetric, PreferenceSignal, PublishAttempt, PublishJob
-from app.operations import analytics_summary, create_channel_variants, create_publish_job, duplicate_topics, execute_job, process_due_jobs, save_metric, token_usage_report, update_variant
+from app.operations import analytics_summary, create_channel_variants, create_publish_job, duplicate_topics, execute_job, process_due_jobs, save_metric, sync_xhs_metric, token_usage_report, update_variant
 from app.schemas import (
-    AnalyticsSummary, ChannelAccountCreate, ChannelAccountRead, ChannelVariantRead,
+    AnalyticsSummary, ChannelAccountCreate, ChannelAccountRead, ChannelVariantRead, ContentMetricRead,
     ChannelVariantUpdate, ManualPublishComplete, MetricCreate, MetricRead, ModelUsageRead,
     PreferenceSignalRead, PublishDecision, PublishJobCreate, PublishJobRead, TokenUsageReport, TopicDuplicateRead,
 )
+from app.xhs_mcp import XhsMcpClient
+from app.xhs_login import login_qrcode_path, login_session_status, start_login_session
 
 router = APIRouter(prefix="/api/v1")
 
@@ -30,6 +34,58 @@ def list_accounts(channel: str | None = Query(default=None, description="按平�
     if channel:
         query = query.where(ChannelAccount.channel == channel)
     return list(db.scalars(query))
+
+
+@router.get("/channel-accounts/{account_id}/connection-status", tags=["渠道账号"], summary="检测渠道账号连接状态")
+def account_connection_status(account_id: str, db: Session = Depends(get_db), _=Depends(require_permission("publish:execute"))):
+    account = db.get(ChannelAccount, account_id)
+    if not account:
+        raise HTTPException(404, "渠道账号不存在")
+    if account.mode != "xhs_mcp":
+        return {"status": "not_applicable", "message": "该账号不使用 XHS MCP"}
+    try:
+        result = XhsMcpClient().auth_status()
+    except Exception as exc:
+        raise HTTPException(502, f"XHS MCP 连接失败：{exc}") from exc
+    status_data = result
+    content = result.get("content", []) if isinstance(result, dict) else []
+    if content and isinstance(content[0], dict) and content[0].get("text"):
+        try:
+            status_data = json.loads(content[0]["text"])
+        except json.JSONDecodeError:
+            pass
+    # MCP 工具有时把执行失败包装在正常的 JSON-RPC result 中，此时 HTTP 和
+    # isError 都可能仍是成功。不能把浏览器故障误报为“账号未登录”。
+    if isinstance(status_data, dict) and status_data.get("success") is False:
+        error_name = status_data.get("error", "XHS MCP 执行失败")
+        error_message = status_data.get("message", "未返回错误详情")
+        raise HTTPException(502, f"XHS MCP 登录检测失败：{error_name}：{error_message}")
+    logged_in = bool(status_data.get("loggedIn", status_data.get("logged_in", False)))
+    return {
+        "status": "logged_in" if logged_in else "logged_out",
+        "message": "XHS MCP 已连接，小红书账号已登录" if logged_in else "XHS MCP 已连接，但小红书账号未登录",
+        "result": status_data,
+    }
+
+
+@router.post("/channel-accounts/{account_id}/login-session", tags=["渠道账号"], summary="创建小红书扫码登录会话")
+def create_account_login_session(account_id: str, db: Session = Depends(get_db), _=Depends(require_permission("publish:execute"))):
+    account = db.get(ChannelAccount, account_id)
+    if not account:
+        raise HTTPException(404, "渠道账号不存在")
+    if account.channel != "xiaohongshu" or account.mode != "xhs_mcp":
+        raise HTTPException(422, "只有 XHS MCP 小红书账号支持扫码登录")
+    return start_login_session()
+
+
+@router.get("/xhs-login-sessions/{session_id}", tags=["渠道账号"], summary="查询小红书扫码登录状态")
+def get_xhs_login_session(session_id: str, _=Depends(require_permission("publish:execute"))):
+    return login_session_status(session_id)
+
+
+@router.get("/xhs-login-sessions/{session_id}/qrcode", tags=["渠道账号"], summary="获取小红书登录二维码")
+def get_xhs_login_qrcode(session_id: str, _=Depends(require_permission("publish:execute"))):
+    return FileResponse(login_qrcode_path(session_id), media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @router.post("/content-tasks/{task_id}/channel-variants", response_model=list[ChannelVariantRead], tags=["多平台内容"], summary="生成平台内容版本")
@@ -77,11 +133,15 @@ def decide_publish_job(job_id: str, data: PublishDecision, db: Session = Depends
     job = db.get(PublishJob, job_id)
     if not job:
         raise HTTPException(404, "发布任务不存在")
+    if job.status != "pending_approval" or job.approval_status != "pending":
+        raise HTTPException(409, "只有待审批的发布任务可以批准或拒绝")
     job.approval_status = "approved" if data.decision == "approve" else "rejected"
     job.status = "approved" if data.decision == "approve" else "rejected"
     job.error_message = data.comment or None
     db.commit(); db.refresh(job)
-    return execute_job(db, job) if data.decision == "approve" else job
+    # 审批只改变审批状态，不应隐式触发外部平台发布。
+    # 真正发布必须由具备 publish:execute 权限的用户显式调用 /execute。
+    return job
 
 
 @router.post("/publish-jobs/{job_id}/execute", response_model=PublishJobRead, tags=["发布任务"], summary="立即执行发布任务")
@@ -135,6 +195,31 @@ def add_metric(job_id: str, data: MetricCreate, db: Session = Depends(get_db), _
 @router.get("/publish-jobs/{job_id}/metrics", response_model=list[MetricRead], tags=["运营数据"], summary="查询发布效果指标")
 def list_metrics(job_id: str, db: Session = Depends(get_db)):
     return list(db.scalars(select(PostMetric).where(PostMetric.publish_job_id == job_id).order_by(PostMetric.collected_at.desc())))
+
+
+@router.post("/publish-jobs/{job_id}/metrics/sync", response_model=MetricRead, status_code=201, tags=["运营数据"], summary="同步小红书文章指标")
+def sync_metric(job_id: str, db: Session = Depends(get_db), _=Depends(require_permission("publish:metrics"))):
+    job = db.get(PublishJob, job_id)
+    if not job:
+        raise HTTPException(404, "发布任务不存在")
+    return sync_xhs_metric(db, job)
+
+
+@router.get("/analytics/content-metrics", response_model=list[ContentMetricRead], tags=["运营数据"], summary="查询文章效果指标快照")
+def content_metrics(db: Session = Depends(get_db), _=Depends(require_permission("analytics:view"))):
+    rows = db.execute(
+        select(PostMetric, PublishJob, ChannelVariant)
+        .join(PublishJob, PublishJob.id == PostMetric.publish_job_id)
+        .join(ChannelVariant, ChannelVariant.id == PublishJob.channel_variant_id)
+        .order_by(PostMetric.collected_at.desc())
+        .limit(200)
+    ).all()
+    return [{
+        **MetricRead.model_validate(metric).model_dump(),
+        "content_title": variant.title,
+        "channel": variant.channel,
+        "external_post_id": job.external_post_id,
+    } for metric, job, variant in rows]
 
 
 @router.get("/analytics/summary", response_model=AnalyticsSummary, tags=["运营数据"], summary="查询运营数据总览")

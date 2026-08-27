@@ -45,6 +45,9 @@ class ContentTask(Base):
     title: Mapped[str] = mapped_column(String(200))
     requirement: Mapped[str] = mapped_column(Text, default="")
     target_audience: Mapped[str] = mapped_column(String(300), default="AI 编程学习者")
+    model_configuration_id: Mapped[str | None] = mapped_column(
+        ForeignKey("model_configurations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     status: Mapped[TaskStatus] = mapped_column(Enum(TaskStatus), default=TaskStatus.draft)
     current_stage: Mapped[str] = mapped_column(String(80), default="draft")
     selected_topic_id: Mapped[str | None] = mapped_column(String(36), nullable=True)

@@ -1,7 +1,7 @@
 import logging
 import re
 from difflib import SequenceMatcher
-from typing import TypedDict
+from typing import Callable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy import select
@@ -28,9 +28,9 @@ class TopicGenerationState(TypedDict, total=False):
 class TopicGenerationSubgraph:
     """组合多个选题来源，并将最终候选保存到业务数据库。"""
 
-    def __init__(self, session_factory: sessionmaker[Session], llm: LLMProvider):
+    def __init__(self, session_factory: sessionmaker[Session], llm_resolver: Callable[[Session, ContentTask], LLMProvider]):
         self.session_factory = session_factory
-        self.llm = llm
+        self.llm_resolver = llm_resolver
 
         builder = StateGraph(TopicGenerationState)
         builder.add_node("initialize", self.initialize)
@@ -72,13 +72,14 @@ class TopicGenerationSubgraph:
             task = db.get(ContentTask, state["task_id"])
             if not task:
                 raise ValueError("内容任务不存在")
-            outputs = self.llm.generate_topics(
+            llm = self.llm_resolver(db, task)
+            outputs = llm.generate_topics(
                 task.title,
                 task.requirement,
                 task.target_audience,
                 state.get("instruction", ""),
             )[: state["llm_topic_count"]]
-            self._save_usage(db, task.id, "generate_topics")
+            self._save_usage(db, task.id, "generate_topics", llm)
             db.commit()
         logger.info("topic_subgraph.llm_complete task_id=%s count=%d", state["task_id"], len(outputs))
         return {**state, "llm_topics": [output.__dict__ for output in outputs]}
@@ -145,8 +146,8 @@ class TopicGenerationSubgraph:
         logger.info("topic_subgraph.persist_complete task_id=%s count=%d", state["task_id"], len(topics))
         return state
 
-    def _save_usage(self, db: Session, task_id: str, operation: str) -> None:
-        usage = self.llm.consume_usage()
+    def _save_usage(self, db: Session, task_id: str, operation: str, llm: LLMProvider) -> None:
+        usage = llm.consume_usage()
         if not usage:
             logger.warning("llm_usage.missing task_id=%s operation=%s", task_id, operation)
             return

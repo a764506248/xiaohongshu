@@ -1,4 +1,5 @@
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 
@@ -20,6 +21,7 @@ from app.operations_api import router as operations_router
 from app.core.config import get_settings
 from app.core.database import Base, SessionLocal, engine
 from app.workflows.content_creation.graph import ContentWorkflow
+from app.workflows.xiaohongshu_packaging import XiaohongshuPackagingWorkflow
 from app.media import STORAGE_ROOT
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,17 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
     settings = get_settings()
+    # Pydantic 会读取 backend/.env，但 LangSmith SDK 直接读取进程环境变量，
+    # 因此在创建/调用 LangGraph 前同步一次配置。
+    os.environ["LANGSMITH_TRACING"] = str(settings.langsmith_tracing).lower()
+    os.environ["LANGSMITH_PROJECT"] = settings.langsmith_project
+    os.environ["LANGSMITH_ENDPOINT"] = settings.langsmith_endpoint
+    os.environ["LANGSMITH_HIDE_INPUTS"] = str(settings.langsmith_hide_inputs).lower()
+    os.environ["LANGSMITH_HIDE_OUTPUTS"] = str(settings.langsmith_hide_outputs).lower()
+    if settings.langsmith_api_key:
+        os.environ["LANGSMITH_API_KEY"] = settings.langsmith_api_key
+    if settings.langsmith_workspace_id:
+        os.environ["LANGSMITH_WORKSPACE_ID"] = settings.langsmith_workspace_id
     with SessionLocal() as db:
         ensure_default_admin(db)
         seed_model_configurations(db)
@@ -42,6 +55,8 @@ async def lifespan(app: FastAPI):
     else:
         checkpointer = InMemorySaver()
     app.state.workflow = ContentWorkflow(SessionLocal, get_llm_provider(), checkpointer)
+    # 小红书平台生产使用独立 Graph，在文章主图完成后运行。
+    app.state.xiaohongshu_packaging_workflow = XiaohongshuPackagingWorkflow(SessionLocal)
     yield
     if checkpoint_context:
         checkpoint_context.__exit__(None, None, None)

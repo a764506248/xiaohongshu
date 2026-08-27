@@ -12,6 +12,7 @@ export interface ContentTask {
   title: string
   requirement: string
   target_audience: string
+  model_configuration_id: string | null
   status: TaskStatus
   current_stage: string
   selected_topic_id: string | null
@@ -99,6 +100,7 @@ export interface ChannelAccount { id:string; name:string; channel:string; mode:s
 export interface PublishJob { id:string; channel_variant_id:string; channel_account_id:string; idempotency_key:string; approval_status:string; status:string; scheduled_at:string|null; published_at:string|null; external_post_id:string|null; retry_count:number; max_retries:number; error_message:string|null; created_at:string; updated_at:string; channel?:string|null; content_title?:string|null; account_name?:string|null; account_mode?:string|null }
 export interface PreferenceSignal { id:string; signal_type:string; signal_value:string; weight:number; sample_count:number; updated_at:string }
 export interface AnalyticsSummary { published_posts:number; total_views:number; total_interactions:number; average_score:number; model_calls:number; total_input_tokens:number; total_output_tokens:number; total_tokens:number; total_latency_ms:number; estimated_model_cost:number; top_signals:PreferenceSignal[] }
+export interface ContentMetric { id:string; publish_job_id:string; content_title:string; channel:string; external_post_id:string|null; views:number; likes:number; favorites:number; comments:number; shares:number; follower_gain:number; performance_score:number; collected_at:string }
 export interface ModelUsage { id:string; content_task_id:string|null; provider:string; model:string; operation:string; input_tokens:number; output_tokens:number; estimated_cost:number; latency_ms:number; status:string; created_at:string }
 export interface TokenUsagePoint { period:string; calls:number; input_tokens:number; output_tokens:number; total_tokens:number; latency_ms:number }
 export interface TokenUsageReport { granularity:'day'|'month'|'year'; start_at:string; end_at:string; calls:number; input_tokens:number; output_tokens:number; total_tokens:number; points:TokenUsagePoint[] }

@@ -1,7 +1,7 @@
 import { ChangeEvent, useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { contentApi } from '../api/content'
-import { ApiError, SERVER_BASE } from '../api/client'
+import { SERVER_BASE } from '../api/client'
 import { Notice } from '../components/Notice'
 import type { ImagePage, XiaohongshuPackage } from '../types'
 
@@ -17,18 +17,43 @@ export function XiaohongshuPackagePage() {
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
+  const [autoStarted, setAutoStarted] = useState(false)
 
   const load = useCallback(async () => {
     try {
       const data = await contentApi.getPackage(id)
+      if (!data) {
+        setPkg(null); setNotCreated(true); setSelectedId('')
+        return
+      }
+      // 后端会先保存页面脚本，再并行生成图片；并行任务尚未结束或部分失败时，
+      // current_version_id 为空。此时自动调用幂等的生成接口补齐缺失图片。
+      if (data.pages.length === 0 || data.pages.some(page => !page.current_version_id)) {
+        setPkg(null); setNotCreated(true); setSelectedId('')
+        return
+      }
       setPkg(data); setNotCreated(false); setSelectedId(current => current || data.pages[0]?.id || '')
     } catch (reason) {
-      if (reason instanceof ApiError && reason.status === 404) setNotCreated(true)
-      else throw reason
+      throw reason
     }
   }, [id])
 
   useEffect(() => { load().catch(reason => setError((reason as Error).message)) }, [load])
+  useEffect(() => {
+    if (!notCreated || autoStarted || busy) return
+    setAutoStarted(true)
+    setBusy('create')
+    setError('')
+    contentApi.createPackage(id)
+      .then(data => {
+        setPkg(data)
+        setNotCreated(false)
+        setSelectedId(data.pages[0]?.id || '')
+        setSuccess('小红书平台内容与图片已生成')
+      })
+      .catch(reason => setError((reason as Error).message))
+      .finally(() => setBusy(''))
+  }, [autoStarted, busy, id, notCreated])
   const selected = useMemo(() => pkg?.pages.find(page => page.id === selectedId) ?? pkg?.pages[0], [pkg, selectedId])
 
   async function action(name: string, callback: () => Promise<unknown>, message = '') {
@@ -55,7 +80,7 @@ export function XiaohongshuPackagePage() {
     await action('order', () => contentApi.reorderPages(id, ids), '页面顺序已更新')
   }
 
-  if (notCreated) return <main className="narrow"><Link className="back" to={`/tasks/${id}`}>← 返回文章</Link><section className="panel centered"><span className="step-number">04</span><h1>生成小红书内容包</h1><p>系统会把已审核文章压缩成 3～5 张竖版图片，并生成标题、正文和标签。</p>{error && <Notice>{error}</Notice>}<button className="button primary" disabled={!!busy} onClick={() => action('create', () => contentApi.createPackage(id), '内容包生成完成')}>{busy ? '正在生成图片…' : '生成内容包'}</button></section></main>
+  if (notCreated) return <main className="narrow"><Link className="back" to={`/tasks/${id}`}>← 返回文章</Link><section className="panel centered"><span className="step-number">04</span><h1>正在生成小红书平台内容</h1><p>独立平台 Graph 正在生成标题、正文、标签和 3～5 张竖版图片，图片会并行处理。</p>{error && <><Notice>{error}</Notice><button className="button primary" disabled={!!busy} onClick={() => { setAutoStarted(false); setError('') }}>重新生成</button></>} {!error && <button className="button primary" disabled>正在并行生成图片…</button>}</section></main>
   if (!pkg || !selected) return <main><div className="empty">正在加载内容包…</div>{error && <Notice>{error}</Notice>}</main>
 
   const image = currentImage(selected)
@@ -86,4 +111,3 @@ export function XiaohongshuPackagePage() {
     </section>
   </main>
 }
-

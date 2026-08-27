@@ -1,0 +1,9 @@
+{
+  "name": "xiaohongshu-login-bridge",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "puppeteer": "^25.9.0",
+    "xhs-mcp": "0.8.13"
+  }
+}

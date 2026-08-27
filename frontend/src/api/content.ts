@@ -25,10 +25,16 @@ import type {
 export const contentApi = {
   listTasks: () => api<ContentTask[]>("/content-tasks"),
   getTask: (id: string) => api<ContentTask>(`/content-tasks/${id}`),
+  updateTask: (id: string, data: Record<string, unknown>) =>
+    api<ContentTask>(`/content-tasks/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(data),
+    }),
   createTask: (data: {
     title: string;
     requirement: string;
     target_audience: string;
+    model_configuration_id?: string | null;
   }) =>
     api<ContentTask>("/content-tasks", {
       method: "POST",
@@ -82,7 +88,7 @@ export const contentApi = {
       method: "POST",
     }),
   getPackage: (id: string) =>
-    api<XiaohongshuPackage>(`/content-tasks/${id}/xiaohongshu-package`),
+    api<XiaohongshuPackage | null>(`/content-tasks/${id}/xiaohongshu-package`),
   updatePackage: (
     id: string,
     data: { title: string; body: string; tags: string },
@@ -132,6 +138,19 @@ export const contentApi = {
       method: "POST",
       body: JSON.stringify(data),
     }),
+  accountConnectionStatus: (id: string) =>
+    api<{ status: string; message: string }>(
+      `/channel-accounts/${id}/connection-status`,
+    ),
+  createAccountLoginSession: (id: string) =>
+    api<{ session_id: string; status: string; message: string }>(
+      `/channel-accounts/${id}/login-session`,
+      { method: "POST" },
+    ),
+  getXhsLoginSession: (id: string) =>
+    api<{ session_id: string; status: string; message: string; qr_image?: string }>(
+      `/xhs-login-sessions/${id}`,
+    ),
   createPublishJob: (data: Record<string, unknown>) =>
     api<PublishJob>("/publish-jobs", {
       method: "POST",
@@ -157,6 +176,9 @@ export const contentApi = {
       method: "POST",
       body: JSON.stringify(data),
     }),
+  syncMetric: (id: string) =>
+    api(`/publish-jobs/${id}/metrics/sync`, { method: "POST" }),
+  contentMetrics: () => api<import("../types").ContentMetric[]>("/analytics/content-metrics"),
   analytics: () => api<AnalyticsSummary>("/analytics/summary"),
   modelUsage: () => api<ModelUsage[]>("/analytics/model-usage"),
   tokenUsage: (

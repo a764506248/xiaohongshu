@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     auth_token_hours: int = 12
     default_admin_username: str = "admin"
     default_admin_password: str = "admin123"
+    xhs_mcp_timeout_seconds: float = 300
+    langsmith_tracing: bool = False
+    langsmith_api_key: str = ""
+    langsmith_endpoint: str = "https://api.smith.langchain.com"
+    langsmith_project: str = "xiaohongshu-content-operations"
+    langsmith_workspace_id: str = ""
+    langsmith_hide_inputs: bool = False
+    langsmith_hide_outputs: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

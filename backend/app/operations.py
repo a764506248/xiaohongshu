@@ -14,6 +14,7 @@ from app.models import (
     PostMetric, PreferenceSignal, PublishAttempt, PublishJob, TaskStatus,
 )
 from app.schemas import ChannelVariantUpdate, MetricCreate, PublishJobCreate
+from app.xhs_mcp import XhsMcpClient, validate_xhs_content
 
 
 def markdown_to_html(markdown: str) -> str:
@@ -80,13 +81,35 @@ def update_variant(db: Session, item: ChannelVariant, data: ChannelVariantUpdate
 
 
 class ChannelAdapter:
-    def publish(self, account: ChannelAccount, variant: ChannelVariant, key: str) -> str:
+    def publish(self, db: Session, account: ChannelAccount, variant: ChannelVariant, key: str):
         raise NotImplementedError
 
 
 class MockChannelAdapter(ChannelAdapter):
-    def publish(self, account: ChannelAccount, variant: ChannelVariant, key: str) -> str:
-        return f"mock-{account.channel}-{uuid.uuid5(uuid.NAMESPACE_URL, key)}"
+    def publish(self, db: Session, account: ChannelAccount, variant: ChannelVariant, key: str):
+        external_id = f"mock-{account.channel}-{uuid.uuid5(uuid.NAMESPACE_URL, key)}"
+        return external_id, external_id
+
+
+class XhsMcpAdapter(ChannelAdapter):
+    def publish(self, db: Session, account: ChannelAccount, variant: ChannelVariant, key: str):
+        if account.channel != "xiaohongshu":
+            raise ValueError("XHS MCP 只支持小红书渠道")
+        package = get_package(db, variant.content_task_id)
+        media_paths = []
+        for page in package.pages:
+            current = next((version for version in page.versions if version.id == page.current_version_id), None)
+            if current:
+                media_paths.append(current.file_path)
+        validate_xhs_content(variant.title, variant.body, media_paths)
+        tags = [tag.lstrip("#") for tag in re.split(r"[\s,，]+", variant.tags) if tag]
+        result = XhsMcpClient().publish(
+            title=variant.title,
+            content=variant.body,
+            media_paths=media_paths,
+            tags=tags,
+        )
+        return result.external_id, result.response_excerpt
 
 
 def create_publish_job(db: Session, data: PublishJobCreate) -> PublishJob:
@@ -117,10 +140,16 @@ def execute_job(db: Session, job: PublishJob) -> PublishJob:
         job.status = "awaiting_manual_publish"; db.commit(); return job
     job.status = "publishing"; db.commit()
     try:
-        external_id = MockChannelAdapter().publish(account, variant, job.idempotency_key)
+        if account.mode == "xhs_mcp":
+            adapter = XhsMcpAdapter()
+        elif account.mode == "mock":
+            adapter = MockChannelAdapter()
+        else:
+            raise ValueError(f"不支持的发布模式：{account.mode}")
+        external_id, response_excerpt = adapter.publish(db, account, variant, job.idempotency_key)
         job.external_post_id = external_id; job.status = "published"; job.published_at = datetime.utcnow()
         variant.status = "published"
-        attempt = PublishAttempt(publish_job_id=job.id, attempt_number=job.retry_count + 1, status="success", response_excerpt=external_id)
+        attempt = PublishAttempt(publish_job_id=job.id, attempt_number=job.retry_count + 1, status="success", response_excerpt=response_excerpt)
     except Exception as exc:
         job.retry_count += 1; job.error_message = str(exc); job.status = "failed"
         attempt = PublishAttempt(publish_job_id=job.id, attempt_number=job.retry_count, status="failed", response_excerpt=str(exc)[:500])
@@ -163,6 +192,47 @@ def save_metric(db: Session, job: PublishJob, data: MetricCreate) -> PostMetric:
         signal.sample_count += 1; signal.weight = round(total / signal.sample_count, 2)
     db.commit(); db.refresh(metric)
     return metric
+
+
+def sync_xhs_metric(db: Session, job: PublishJob) -> PostMetric:
+    """从小红书抓取已发布文章的实时指标并保存不可变快照。"""
+    if job.status != "published" or not job.external_post_id:
+        raise HTTPException(409, "只有带真实平台链接的已发布任务可以同步数据")
+    variant = db.get(ChannelVariant, job.channel_variant_id)
+    account = db.get(ChannelAccount, job.channel_account_id)
+    if not variant or variant.channel != "xiaohongshu" or not account or account.mode != "xhs_mcp":
+        raise HTTPException(422, "只有 XHS MCP 发布的小红书文章支持自动同步")
+    feed_id = job.external_post_id.rstrip("/").split("/")[-1].split("?")[0]
+    client = XhsMcpClient()
+    notes = client.user_notes(limit=50)
+    note = next((item for item in notes if (client._note_reference(item) or "").split("?")[0].endswith(f"/{feed_id}")), None)
+    if not note:
+        raise HTTPException(502, "小红书账号笔记列表中未找到该文章")
+    xsec_token = client.find_value(note, ("xsecToken", "xsec_token"))
+    source = note
+    if xsec_token:
+        source = client.note_detail(feed_id, str(xsec_token))
+
+    def count(*keys: str) -> int:
+        raw = client.find_value(source, tuple(keys))
+        if isinstance(raw, str):
+            raw = raw.replace(",", "").strip()
+            multipliers = {"万": 10000, "w": 10000, "k": 1000}
+            suffix = raw[-1:].lower()
+            try:
+                return int(float(raw[:-1]) * multipliers[suffix]) if suffix in multipliers else int(float(raw))
+            except ValueError:
+                return 0
+        return int(raw or 0)
+
+    return save_metric(db, job, MetricCreate(
+        views=count("viewCount", "view_count", "views", "exposureCount", "exposure_count"),
+        likes=count("likedCount", "likeCount", "liked_count", "likes"),
+        favorites=count("collectedCount", "collectCount", "collected_count", "favorites"),
+        comments=count("commentCount", "comment_count", "comments"),
+        shares=count("shareCount", "share_count", "shares"),
+        follower_gain=count("followerGain", "follower_gain"),
+    ))
 
 
 def analytics_summary(db: Session) -> dict:

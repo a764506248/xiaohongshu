@@ -14,12 +14,14 @@ class ContentTaskCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200, description="内容方向或主题", examples=["LangGraph 人工审核实战"])
     requirement: str = Field(default="", description="语气、重点、篇幅等补充要求", examples=["表达克制，突出可操作步骤"])
     target_audience: str = Field(default="AI 编程学习者", description="文章的目标读者", examples=["AI 应用开发初学者"])
+    model_configuration_id: str | None = Field(default=None, description="本任务使用的文本模型配置 ID；为空时使用默认模型")
 
 
 class ContentTaskUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=200, description="新的内容方向；不传则保持不变")
     requirement: str | None = Field(default=None, description="新的补充要求；不传则保持不变")
     target_audience: str | None = Field(default=None, description="新的目标读者；不传则保持不变")
+    model_configuration_id: str | None = Field(default=None, description="新的文本模型配置 ID")
 
 
 class ContentTaskRead(ORMModel):
@@ -27,6 +29,7 @@ class ContentTaskRead(ORMModel):
     title: str = Field(description="内容方向或主题")
     requirement: str = Field(description="运营人员填写的补充要求")
     target_audience: str = Field(description="目标读者")
+    model_configuration_id: str | None = Field(description="任务固定使用的文本模型配置 ID")
     status: TaskStatus = Field(description="业务状态，前端根据该字段展示当前操作")
     current_stage: str = Field(description="工作流当前阶段，通常与 status 对应")
     selected_topic_id: str | None = Field(description="已选候选选题 ID；尚未选择时为 null")
@@ -164,15 +167,15 @@ class XiaohongshuPackageUpdate(BaseModel):
 class ChannelAccountCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120, description="运营人员可识别的账号名称")
     channel: Literal["xiaohongshu", "wechat"] = Field(description="内容平台")
-    mode: Literal["manual", "mock"] = Field(default="manual", description="manual 表示人工发布，mock 用于本地自动发布演示")
-    credential_reference: str = Field(default="", description="外部密钥管理器中的凭证引用；不要直接提交明文密钥")
+    mode: Literal["manual", "mock", "xhs_mcp"] = Field(default="manual", description="manual 表示人工发布，mock 用于演示，xhs_mcp 使用本地 Puppeteer MCP")
+    credential_reference: str = Field(default="", max_length=200, description="MCP 账号别名或外部凭证引用；不保存 Cookie")
 
 
 class ChannelAccountRead(ORMModel):
     id: str = Field(description="平台账号 UUID")
     name: str = Field(description="账号名称")
     channel: str = Field(description="平台：xiaohongshu 或 wechat")
-    mode: str = Field(description="发布模式：manual 或 mock")
+    mode: str = Field(description="发布模式：manual、mock 或 xhs_mcp")
     credential_reference: str = Field(description="凭证引用，不包含实际密钥")
     status: str = Field(description="账号状态")
     created_at: datetime = Field(description="创建时间，UTC")
@@ -260,6 +263,12 @@ class MetricRead(ORMModel):
     follower_gain: int = Field(description="粉丝净增长")
     performance_score: float = Field(description="根据互动率、收藏、分享和涨粉计算的 0～100 分")
     collected_at: datetime = Field(description="指标采集时间，UTC")
+
+
+class ContentMetricRead(MetricRead):
+    content_title: str = Field(description="文章或平台版本标题")
+    channel: str = Field(description="发布平台")
+    external_post_id: str | None = Field(description="平台笔记 URL 或 ID")
 
 
 class PreferenceSignalRead(ORMModel):

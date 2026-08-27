@@ -4,12 +4,13 @@ import json
 import re
 import textwrap
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from fastapi import HTTPException, UploadFile
 from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from app.models import (
     Article, ArticleVersion, ContentTask, ImagePage, ImageVersion, TaskStatus, XiaohongshuPackage,
@@ -91,12 +92,18 @@ class LocalImageProvider:
         return digest, self.width, self.height
 
 
-def get_package(db: Session, task_id: str) -> XiaohongshuPackage:
-    package = db.scalar(
+def find_package(db: Session, task_id: str) -> XiaohongshuPackage | None:
+    """查询任务的内容包；尚未生成时返回 None，由调用方决定业务语义。"""
+    return db.scalar(
         select(XiaohongshuPackage)
         .options(selectinload(XiaohongshuPackage.pages).selectinload(ImagePage.versions))
         .where(XiaohongshuPackage.content_task_id == task_id)
     )
+
+
+def get_package(db: Session, task_id: str) -> XiaohongshuPackage:
+    """获取必须存在的内容包，供编辑、导出、发布等接口使用。"""
+    package = find_package(db, task_id)
     if not package:
         raise HTTPException(404, "小红书内容包尚未生成")
     return package
@@ -124,17 +131,33 @@ def render_page(db: Session, page: ImagePage, source_type: str = "generated") ->
     relative = f"{page.package_id}/{page.id}-v{next_number}.png"
     output = STORAGE_ROOT / relative
     settings = get_settings()
-    model = default_image_model(db) if settings.app_env != "test" and settings.aliyun_model_api_key else None
-    if model:
-        prompt = f"{page.visual_description}。竖版社交媒体知识卡片。标题：{page.title}。正文要点：{page.body}"
-        image_bytes, _, _ = generate_image(model, prompt)
+    # 自动化测试继续使用确定性的本地渲染；真实环境必须调用模型管理中
+    # 已启用的阿里图片模型，不再静默生成一张本地占位海报。
+    if settings.app_env == "test":
+        digest, width, height = LocalImageProvider().render(page, output)
+    else:
+        model = default_image_model(db)
+        if not model:
+            raise HTTPException(503, "没有可用的阿里图片模型，请先在模型管理中启用图片模型")
+        api_key = model.api_key or settings.aliyun_model_api_key
+        if not api_key:
+            raise HTTPException(503, f"阿里图片模型 {model.name} 尚未配置 API Key")
+        prompt = (
+            "生成一张竖版小红书技术知识卡片，画面比例约为3:4，版式简洁专业，"
+            "中文必须清晰可读，不要水印。"
+            f"视觉说明：{page.visual_description}。"
+            f"页面标题：{page.title}。正文要点：{page.body}。"
+            "使用统一的教育科技品牌视觉，保留充分留白和清晰的信息层级。"
+        )
+        try:
+            image_bytes, _, _ = generate_image(model, prompt, api_key=api_key)
+        except Exception as exc:
+            raise HTTPException(502, f"阿里图片模型 {model.model} 生成失败：{exc}") from exc
         output.parent.mkdir(parents=True, exist_ok=True)
         generated = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         generated.save(output, format="PNG", optimize=True)
         digest, width, height = hashlib.sha256(output.read_bytes()).hexdigest(), generated.width, generated.height
         source_type = f"{source_type}:{model.model}"
-    else:
-        digest, width, height = LocalImageProvider().render(page, output)
     version = ImageVersion(
         page_id=page.id, version_number=next_number, file_path=str(output), public_url=f"/media/{relative}",
         source_type=source_type, width=width, height=height, file_hash=digest,
@@ -146,9 +169,59 @@ def render_page(db: Session, page: ImagePage, source_type: str = "generated") ->
     return version
 
 
+def render_pages_parallel(db: Session, page_ids: list[str]) -> None:
+    """在主 Graph 结束后并行生成内容包中的图片。
+
+    SQLAlchemy Session 不能跨线程共享，因此每张图片都使用独立会话和事务。
+    某张图片失败时，其他已成功图片仍会保留；再次请求内容包只会补生成
+    尚无 current_version_id 的页面，避免重复消耗图片模型额度。
+    """
+    if not page_ids:
+        return
+
+    worker_sessions = sessionmaker(bind=db.get_bind(), autoflush=False, expire_on_commit=False)
+
+    def render_one(page_id: str) -> str:
+        with worker_sessions() as worker_db:
+            page = worker_db.get(ImagePage, page_id)
+            if not page:
+                raise RuntimeError(f"图片页面不存在：{page_id}")
+            if page.current_version_id:
+                return page_id
+            render_page(worker_db, page)
+            worker_db.commit()
+            return page_id
+
+    # 小红书内容包最多 5 张图。限制为 4 个并发，避免瞬间打满模型服务限流。
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(4, len(page_ids)), thread_name_prefix="image-generation") as executor:
+        futures = {executor.submit(render_one, page_id): page_id for page_id in page_ids}
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:
+                errors.append(f"{futures[future]}: {exc}")
+    if errors:
+        raise HTTPException(502, "部分图片生成失败：" + "；".join(errors))
+
+
 def create_package(db: Session, task_id: str) -> XiaohongshuPackage:
+    # 图片生成耗时较长，同一个任务可能因为重复点击、重试或多个浏览器标签页
+    # 同时进入这里。PostgreSQL 事务级 advisory lock 保证同一 task_id 同时只有
+    # 一个创建者；等待者拿到锁后会读取并直接返回已生成的内容包。
+    if db.bind and db.bind.dialect.name == "postgresql":
+        db.execute(select(func.pg_advisory_xact_lock(func.hashtext(task_id))))
     existing = db.scalar(select(XiaohongshuPackage).where(XiaohongshuPackage.content_task_id == task_id))
     if existing:
+        # 上一次并行任务可能只有部分页面失败；重试时只补齐失败页面。
+        pending_page_ids = list(db.scalars(
+            select(ImagePage.id).where(
+                ImagePage.package_id == existing.id,
+                ImagePage.current_version_id.is_(None),
+            )
+        ))
+        render_pages_parallel(db, pending_page_ids)
+        db.expire_all()
         return get_package(db, task_id)
     task = db.get(ContentTask, task_id)
     if not task:
@@ -166,6 +239,7 @@ def create_package(db: Session, task_id: str) -> XiaohongshuPackage:
     )
     db.add(package)
     db.flush()
+    page_ids: list[str] = []
     for index, spec in enumerate(_visual_script(version), start=1):
         page = ImagePage(
             package_id=package.id, page_number=index, title=spec["title"], body=spec["body"],
@@ -173,8 +247,12 @@ def create_package(db: Session, task_id: str) -> XiaohongshuPackage:
         )
         db.add(page)
         db.flush()
-        render_page(db, page)
+        page_ids.append(page.id)
+    # 先提交内容包和页面脚本。图片属于主 Graph 结束后的下游产物，随后使用
+    # 独立会话并行生成，不把耗时的模型调用串进 LangGraph/checkpointer。
     db.commit()
+    render_pages_parallel(db, page_ids)
+    db.expire_all()
     return get_package(db, task_id)
 
 

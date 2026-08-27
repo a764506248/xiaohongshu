@@ -5,6 +5,7 @@ import { Notice } from "../components/Notice";
 import { StatusBadge } from "../components/StatusBadge";
 import type { Article, ContentTask, Review, Topic } from "../types";
 import type { StreamEvent } from "../api/client";
+import { modelApi, type ModelConfiguration } from "../api/models";
 
 export function TaskDetail() {
   const { id = "" } = useParams();
@@ -19,6 +20,7 @@ export function TaskDetail() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
   const [streamEvents, setStreamEvents] = useState<StreamEvent[]>([]);
+  const [models, setModels] = useState<ModelConfiguration[]>([]);
   const [streamStatus, setStreamStatus] = useState<
     "idle" | "connecting" | "streaming" | "completed" | "error"
   >("idle");
@@ -45,7 +47,15 @@ export function TaskDetail() {
 
   useEffect(() => {
     load().catch((e: Error) => setError(e.message));
+    modelApi.list().then(items => setModels(items.filter(item => item.enabled && item.capability === "text" && ["openai_compatible", "anthropic_compatible"].includes(item.protocol)))).catch(() => undefined);
   }, [load]);
+
+  async function changeModel(model_configuration_id: string) {
+    setBusy("model"); setError("");
+    try { setTask(await contentApi.updateTask(id, { model_configuration_id: model_configuration_id || null })); }
+    catch (e) { setError((e as Error).message); }
+    finally { setBusy(""); }
+  }
   const currentVersion = useMemo(
     () =>
       article?.versions.find((v) => v.id === article.current_version_id) ??
@@ -157,6 +167,12 @@ export function TaskDetail() {
             {task.status === "failed" ? "重新生成候选选题" : "生成候选选题"}
           </h2>
           <p>AI 将从实战、避坑、案例和工具对比等角度提供候选方案。</p>
+          <label className="task-model-select">调用模型
+            <select value={task.model_configuration_id ?? ""} disabled={!!busy} onChange={e => changeModel(e.target.value)}>
+              <option value="">系统默认模型（ENV）</option>
+              {models.map(model => <option value={model.id} key={model.id}>{model.name} · {model.model}</option>)}
+            </select>
+          </label>
           <textarea
             rows={3}
             value={instruction}

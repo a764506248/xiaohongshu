@@ -6,14 +6,15 @@ from langgraph.graph import END, START, StateGraph
 # Command(resume=...) 用于恢复暂停的流程；interrupt() 用于主动暂停流程。
 from langgraph.types import Command, interrupt
 # func 用来执行 max 等数据库函数；select 用来构造 SQLAlchemy 查询。
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 # Session 是数据库会话类型；sessionmaker 是创建会话的工厂。
 from sqlalchemy.orm import Session, sessionmaker
 
 # LLMProvider 隔离具体模型服务商；TopicOutput 是传给文章生成器的选题结构。
-from app.ai.provider import LLMProvider, TopicOutput
+from app.ai.provider import FallbackLLMProvider, LLMProvider, TopicOutput, provider_from_model_configuration
+from app.core.config import get_settings
 # 数据库保存完整业务数据；LangGraph state 只保存这些数据的 ID 和路由信息。
-from app.models import Article, ArticleVersion, ContentTask, ModelUsageEvent, ReviewRecord, TaskStatus, TopicCandidate
+from app.models import Article, ArticleVersion, ContentTask, ModelConfiguration, ModelUsageEvent, ReviewRecord, TaskStatus, TopicCandidate
 # ContentState 定义整个图运行过程中可以携带的字段。
 from app.workflows.content_creation.state import ContentState
 from app.workflows.content_creation.topic_subgraph import TopicGenerationSubgraph
@@ -44,7 +45,7 @@ class ContentWorkflow:
         builder = StateGraph(ContentState)
 
         # 选题生成本身是一张子图：LLM 生成、RAG 召回、合并排序、持久化都可独立迭代。
-        self.topic_generation = TopicGenerationSubgraph(session_factory, llm)
+        self.topic_generation = TopicGenerationSubgraph(session_factory, self._llm_for_task)
         # 主图仍使用 generate_topics 这个稳定节点名，后续主流程无需感知子图内部变化。
         builder.add_node("generate_topics", self.topic_generation.graph)
         builder.add_node("select_topic", self.select_topic)
@@ -76,13 +77,22 @@ class ContentWorkflow:
         self.graph = builder.compile(checkpointer=checkpointer)
 
     @staticmethod
-    def config(thread_id: str) -> dict:
+    def config(thread_id: str, task_id: str, model_configuration_id: str | None = None) -> dict:
         """生成 LangGraph 每次调用都需要的配置。
 
         thread_id 相当于工作流存档编号。启动和恢复必须使用同一个编号，
         否则 LangGraph 无法找到之前 interrupt 时保存的 checkpoint。
         """
-        return {"configurable": {"thread_id": thread_id}}
+        return {
+            "configurable": {"thread_id": thread_id},
+            "run_name": "xiaohongshu-content-workflow",
+            "tags": ["xiaohongshu", "content-workflow"],
+            "metadata": {
+                "task_id": task_id,
+                "thread_id": thread_id,
+                "model_configuration_id": model_configuration_id or "env-default",
+            },
+        }
 
     def start(self, task_id: str, instruction: str = "", llm_topic_count: int = 4, rag_topic_count: int = 3):
         """从 START 启动一个全新的内容工作流。"""
@@ -97,6 +107,7 @@ class ContentWorkflow:
                 raise ValueError("内容任务不存在")
             # 将工作流存档编号写入任务，后续 resume 会从这里取回。
             task.workflow_thread_id = thread_id
+            model_configuration_id = task.model_configuration_id
             db.commit()
         # 初始 state 只存任务 ID 和本次补充指令；随后从 START 开始执行。
         try:
@@ -105,7 +116,7 @@ class ContentWorkflow:
                 "instruction": instruction,
                 "llm_topic_count": llm_topic_count,
                 "rag_topic_count": rag_topic_count,
-            }, self.config(thread_id))
+            }, self.config(thread_id, task_id, model_configuration_id))
             logger.info("content_workflow.paused_or_finished task_id=%s thread_id=%s", task_id, thread_id)
             return result
         except Exception:
@@ -120,6 +131,7 @@ class ContentWorkflow:
             if not task:
                 raise ValueError("内容任务不存在")
             task.workflow_thread_id = thread_id
+            model_configuration_id = task.model_configuration_id
             db.commit()
         initial = {"task_id": task_id, "instruction": instruction, "llm_topic_count": llm_topic_count, "rag_topic_count": rag_topic_count}
         yield {"event": "started", "node": "START", "message": "工作流已启动"}
@@ -128,7 +140,7 @@ class ContentWorkflow:
             # LLM 调用期间前端会长时间没有反馈，看起来像一次性返回。
             for namespace, task_event in self.graph.stream(
                 initial,
-                self.config(thread_id),
+                self.config(thread_id, task_id, model_configuration_id),
                 stream_mode="tasks",
                 subgraphs=True,
             ):
@@ -145,11 +157,12 @@ class ContentWorkflow:
             if not task or not task.workflow_thread_id:
                 raise ValueError("任务没有可恢复的工作流")
             thread_id = task.workflow_thread_id
+            model_configuration_id = task.model_configuration_id
         yield {"event": "started", "node": "resume", "message": "已恢复工作流"}
         try:
             for namespace, task_event in self.graph.stream(
                 Command(resume=value),
-                self.config(thread_id),
+                self.config(thread_id, task_id, model_configuration_id),
                 stream_mode="tasks",
                 subgraphs=True,
             ):
@@ -224,6 +237,7 @@ class ContentWorkflow:
             if not task or not task.workflow_thread_id:
                 raise ValueError("任务没有可恢复的工作流")
             thread_id = task.workflow_thread_id
+            model_configuration_id = task.model_configuration_id
         # 只记录决定类型和字段名，不打印审核意见或其他用户正文。
         logger.info(
             "content_workflow.resume task_id=%s thread_id=%s decision=%s fields=%s",
@@ -234,7 +248,7 @@ class ContentWorkflow:
         )
         # Command(resume=value) 会让上次 interrupt() 返回 value，然后继续执行该节点。
         try:
-            result = self.graph.invoke(Command(resume=value), self.config(thread_id))
+            result = self.graph.invoke(Command(resume=value), self.config(thread_id, task_id, model_configuration_id))
             logger.info("content_workflow.resumed task_id=%s thread_id=%s", task_id, thread_id)
             return result
         except Exception:
@@ -290,10 +304,11 @@ class ContentWorkflow:
             # 优先把审核意见作为修改指令；没有审核意见时使用启动阶段的补充指令。
             instruction = review.get("comment", "") or state.get("instruction", "")
             # 将数据库选题转换回 LLMProvider 所需的结构，然后生成文章。
-            output = self.llm.generate_article(
+            llm = self._llm_for_task(db, task)
+            output = llm.generate_article(
                 TopicOutput(topic.title, topic.summary, topic.target_reader, topic.reason, topic.score), instruction
             )
-            self._save_usage(db, task.id, "generate_article")
+            self._save_usage(db, task.id, "generate_article", llm)
 
             # 一项内容任务只有一个 Article 主体，但可以拥有多个不可变版本。
             article = db.scalar(select(Article).where(Article.content_task_id == task.id))
@@ -375,9 +390,42 @@ class ContentWorkflow:
         # finish 后沿固定边到 END，此返回值作为工作流最终 state。
         return state
 
-    def _save_usage(self, db: Session, task_id: str, operation: str) -> None:
+    def _llm_for_task(self, db: Session, task: ContentTask) -> LLMProvider:
+        primary = db.get(ModelConfiguration, task.model_configuration_id) if task.model_configuration_id else None
+        # 自动化测试必须保持完全离线；显式选择模型的专项测试仍会经过下面的动态解析。
+        if get_settings().app_env == "test" and not primary:
+            return self.llm
+        # 个人模型只允许作为任务明确选择的首选项；自动兜底仅使用系统模型，
+        # 避免错误使用其他用户保存在数据库中的私有密钥。
+        system_models = list(db.scalars(
+            select(ModelConfiguration)
+            .where(
+                ModelConfiguration.owner_user_id.is_(None),
+                ModelConfiguration.capability == "text",
+                ModelConfiguration.enabled.is_(True),
+                ModelConfiguration.protocol.in_(["openai_compatible", "anthropic_compatible"]),
+            )
+            .order_by(
+                # 阿里 0731 是额度兜底，优先于当前已出现额度不足的服务。
+                case((ModelConfiguration.model == "deepseek-v4-flash-0731", 0), else_=1),
+                ModelConfiguration.is_default.desc(),
+                ModelConfiguration.created_at.asc(),
+            )
+        ))
+        ordered = ([primary] if primary else []) + system_models
+        providers, seen = [], set()
+        for model in ordered:
+            if not model or model.id in seen:
+                continue
+            seen.add(model.id)
+            providers.append(provider_from_model_configuration(model))
+        if not providers:
+            return self.llm
+        return FallbackLLMProvider(providers)
+
+    def _save_usage(self, db: Session, task_id: str, operation: str, llm: LLMProvider | None = None) -> None:
         """将刚完成的模型调用统计写入业务库，正文和 Prompt 不进入统计表。"""
-        usage = self.llm.consume_usage()
+        usage = (llm or self.llm).consume_usage()
         if not usage:
             logger.warning("llm_usage.missing task_id=%s operation=%s", task_id, operation)
             return
